@@ -11,7 +11,7 @@ use File::Spec ();
 use FFI::Platypus 2.00;
 use JSON::PP ();
 
-my $JSON = JSON::PP->new->utf8->canonical;
+my $JSON = JSON::PP->new->utf8->canonical->allow_nonref;
 
 my $ffi = FFI::Platypus->new( api => 2 );
 $ffi->lib( _find_lib() );
@@ -23,7 +23,8 @@ $ffi->attach( [ st_index_open     => '_open' ]        => ['string']             
 $ffi->attach( [ st_index_add_json => '_add_json' ]    => [ 'st_index', 'string' ]               => 'int' );
 $ffi->attach( [ st_index_commit   => '_commit' ]      => ['st_index']                           => 'int' );
 $ffi->attach( [ st_index_num_docs => '_num_docs' ]    => ['st_index']                           => 'sint64' );
-$ffi->attach( [ st_index_search   => '_search' ]      => [ 'st_index', 'string', 'string', 'size_t' ] => 'opaque' );
+$ffi->attach( [ st_index_search   => '_search' ]      => [ 'st_index', 'string', 'string' ]     => 'opaque' );
+$ffi->attach( [ st_index_delete_term => '_delete_term' ] => [ 'st_index', 'string', 'string' ] => 'int' );
 $ffi->attach( [ st_string_free    => '_string_free' ] => ['opaque']                             => 'void' );
 $ffi->attach( [ st_index_free     => 'DESTROY' ]      => ['st_index']                           => 'void' );
 
@@ -93,6 +94,21 @@ sub add {
     return $self;
 }
 
+sub delete {
+    my ( $self, $field, $value ) = @_;
+    defined $field && defined $value or croak 'delete: field and value are required';
+    _delete_term( $self, $field, $JSON->encode($value) ) == 0 or _fail();
+    return $self;
+}
+
+sub update {
+    my ( $self, $key, $doc ) = @_;
+    defined $key or croak 'update: key field is required';
+    ref $doc eq 'HASH' or croak 'update: document must be a hash ref';
+    defined $doc->{$key} or croak "update: document has no value for key field '$key'";
+    return $self->delete( $key, $doc->{$key} )->add($doc);
+}
+
 sub commit {
     my ($self) = @_;
     _commit($self) == 0 or _fail();
@@ -109,10 +125,13 @@ sub num_docs {
 sub search {
     my ( $self, $query, %opt ) = @_;
     defined $query or croak 'search: query is required';
-    my $limit  = $opt{limit} // 10;
-    my $fields = $opt{fields} ? $JSON->encode( $opt{fields} ) : undef;
+    my %known = map { $_ => 1 } qw(limit fields snippets snippet_chars highlight);
+    my @unknown = grep { !$known{$_} } sort keys %opt;
+    croak "search: unknown option(s): @unknown" if @unknown;
+    $opt{limit} += 0 if defined $opt{limit};
+    $opt{snippet_chars} += 0 if defined $opt{snippet_chars};
 
-    my $ptr = _search( $self, $query, $fields, $limit ) or _fail();
+    my $ptr = _search( $self, $query, $JSON->encode( \%opt ) ) or _fail();
     my $json = $ffi->cast( 'opaque' => 'string', $ptr );
     _string_free($ptr);
     return @{ $JSON->decode($json) };
@@ -183,6 +202,20 @@ Opens an existing on-disk index.
 Adds a document. Numeric fields accept numbers or numeric strings. Documents
 are not searchable until L</commit>.
 
+=head2 delete($field, $value)
+
+Deletes every document whose C<$field> equals C<$value>. The field must be a
+C<string> or numeric field (an exact key such as an id or URL); tokenized
+C<text> fields are rejected. Takes effect on L</commit>.
+
+=head2 update($key_field, \%doc)
+
+Replaces the document(s) whose C<$key_field> equals C<< $doc->{$key_field} >>
+with C<\%doc> (or just adds it if there was none). Same rules as L</delete>;
+takes effect on L</commit>.
+
+    $index->update( url => { url => '/perl', title => 'Programming Perl, 4th ed.' } )->commit;
+
 =head2 commit
 
 Writes pending documents and makes them visible to L</search>.
@@ -192,10 +225,18 @@ Writes pending documents and makes them visible to L</search>.
 Runs a query in tantivy's query language (C<perl AND camel>, C<title:rust>,
 C<"exact phrase">, C<year:[2000 TO 2020]>). Options: C<limit> (default 10),
 C<fields> (array ref of fields searched by terms without a C<field:> prefix;
-default: all text and string fields).
+default: all text and string fields), C<snippets> (array ref of stored text
+fields to build highlighted excerpts for), C<snippet_chars> (maximum excerpt
+length, default 150) and C<highlight> (array ref C<< [$before, $after] >>,
+default C<< ['<b>', '</b>'] >>).
 
 Returns a list of hash refs C<< { score => $float, doc => \%stored_fields } >>,
-best first. A field with one value is a plain scalar; a field with several
+best first. With C<snippets>, each hit also has C<< snippets => { $field => $html } >>:
+an excerpt with the matching terms wrapped in the highlight markup and the rest
+HTML-escaped; empty if the field did not match.
+
+    my ($hit) = $index->search( 'camel', snippets => ['body'] );
+    print $hit->{snippets}{body};   # The <b>camel</b> book about Perl 5 A field with one value is a plain scalar; a field with several
 values is an array ref.
 
 =head2 num_docs

@@ -1,5 +1,7 @@
 # Search::Tantivy
 
+[![CI](https://github.com/Neid/Search-Tantivy/actions/workflows/ci.yml/badge.svg)](https://github.com/Neid/Search-Tantivy/actions/workflows/ci.yml)
+
 Fast full-text search for Perl, powered by [tantivy](https://github.com/quickwit-oss/tantivy) (Rust).
 Embedded: no search server, the index is a directory (or in memory).
 
@@ -13,9 +15,15 @@ my $index = Search::Tantivy->create(
 $index->add({ title => 'Programming Perl', body => 'The camel book', url => '/perl', year => 1991 });
 $index->commit;
 
-for my $hit ($index->search('camel OR title:perl', limit => 5)) {
-    printf "%.3f %s\n", $hit->{score}, $hit->{doc}{title};
+for my $hit ($index->search('camel OR title:perl', limit => 5, snippets => ['body'])) {
+    printf "%.3f %s - %s\n", $hit->{score}, $hit->{doc}{title}, $hit->{snippets}{body};
+    # 1.234 Programming Perl - The <b>camel</b> book
 }
+
+# replace or remove documents by an exact key ('string' or numeric field)
+$index->update(url => { url => '/perl', title => 'Programming Perl, 4th ed.', body => '...' });
+$index->delete(url => '/old-page');
+$index->commit;
 ```
 
 Status: early, API may change.
@@ -39,8 +47,6 @@ into Perl exceptions.
 
 ## Roadmap
 
-- delete / update documents by term
-- snippets with highlighted matches
 - facets and sorting by fast fields
 - custom tokenizers and stemming (language support)
 - prebuilt binaries so installing does not require Rust

@@ -7,6 +7,14 @@
 //! - Strings returned to the caller are owned by Rust and must be released with
 //!   `st_string_free()`.
 //! - Data crosses the boundary as JSON (schema, documents, search results).
+//!
+//! # Safety
+//! Every `unsafe extern "C"` function expects string arguments that are NULL
+//! or valid NUL-terminated strings, and index handles that are NULL or were
+//! returned by `st_index_create` / `st_index_open` and not yet freed. Handles
+//! must not be used from several threads at once.
+
+#![allow(clippy::missing_safety_doc)] // covered by the crate-level Safety section
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -22,7 +30,8 @@ use tantivy::schema::document::Document as _;
 use tantivy::schema::{
     Field, FieldType, NumericOptions, STORED, STRING, Schema, TEXT, TextOptions,
 };
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
+use tantivy::snippet::SnippetGenerator;
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 const WRITER_HEAP_BYTES: usize = 50_000_000;
 
@@ -105,7 +114,11 @@ impl StIndex {
             .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .map_err(err("cannot open index reader"))?;
-        Ok(Self { index, reader, writer: None })
+        Ok(Self {
+            index,
+            reader,
+            writer: None,
+        })
     }
 
     fn writer(&mut self) -> Res<&mut IndexWriter> {
@@ -281,8 +294,11 @@ pub unsafe extern "C" fn st_index_add_json(h: *mut StIndex, doc_json: *const c_c
             serde_json::from_str(json).map_err(err("document must be a JSON object"))?;
         coerce_numbers(&schema, &mut map);
         let normalized = Value::Object(map).to_string();
-        let doc = TantivyDocument::parse_json(&schema, &normalized).map_err(err("invalid document"))?;
-        h.writer()?.add_document(doc).map_err(err("cannot add document"))?;
+        let doc =
+            TantivyDocument::parse_json(&schema, &normalized).map_err(err("invalid document"))?;
+        h.writer()?
+            .add_document(doc)
+            .map_err(err("cannot add document"))?;
         Ok(0)
     })
 }
@@ -307,30 +323,61 @@ pub unsafe extern "C" fn st_index_num_docs(h: *mut StIndex) -> i64 {
     })
 }
 
-/// Run a query. `fields_json` is an optional JSON array of default field
-/// names (NULL = all indexed text fields). Returns a JSON array of
-/// `{"score": f, "doc": {...}}` to be freed with `st_string_free`, or NULL.
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SearchOptions {
+    /// Default fields for terms without a `field:` prefix.
+    fields: Option<Vec<String>>,
+    limit: usize,
+    /// Stored text fields to build highlighted snippets for.
+    snippets: Vec<String>,
+    snippet_chars: Option<usize>,
+    /// Markup around highlighted terms, default `<b>` / `</b>`.
+    highlight: Option<(String, String)>,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            fields: None,
+            limit: 10,
+            snippets: Vec::new(),
+            snippet_chars: None,
+            highlight: None,
+        }
+    }
+}
+
+fn field_by_name(schema: &Schema, name: &str) -> Res<Field> {
+    schema
+        .get_field(name)
+        .map_err(|_| format!("unknown field '{name}'"))
+}
+
+/// Run a query. `options_json` is an optional JSON object (see
+/// `SearchOptions`). Returns a JSON array of
+/// `{"score": f, "doc": {...}, "snippets": {...}}` to be freed with
+/// `st_string_free`, or NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn st_index_search(
     h: *mut StIndex,
     query: *const c_char,
-    fields_json: *const c_char,
-    limit: usize,
+    options_json: *const c_char,
 ) -> *mut c_char {
     guard(ptr::null_mut(), || {
         let h = unsafe { handle(h) }?;
         let query = unsafe { req_str(query, "query") }?;
+        let opts: SearchOptions = match unsafe { opt_str(options_json) }? {
+            Some(j) => serde_json::from_str(j).map_err(err("invalid search options"))?,
+            None => SearchOptions::default(),
+        };
         let schema = h.index.schema();
 
-        let fields: Vec<Field> = match unsafe { opt_str(fields_json) }? {
-            Some(j) => {
-                let names: Vec<String> =
-                    serde_json::from_str(j).map_err(err("fields must be a JSON array"))?;
-                names
-                    .iter()
-                    .map(|n| schema.get_field(n).map_err(|_| format!("unknown field '{n}'")))
-                    .collect::<Res<_>>()?
-            }
+        let fields: Vec<Field> = match &opts.fields {
+            Some(names) => names
+                .iter()
+                .map(|n| field_by_name(&schema, n))
+                .collect::<Res<_>>()?,
             None => schema
                 .fields()
                 .filter(|(_, e)| matches!(e.field_type(), FieldType::Str(_)) && e.is_indexed())
@@ -341,18 +388,115 @@ pub unsafe extern "C" fn st_index_search(
         let parser = QueryParser::for_index(&h.index, fields);
         let q = parser.parse_query(query).map_err(err("invalid query"))?;
         let searcher = h.reader.searcher();
+
+        let mut generators = Vec::with_capacity(opts.snippets.len());
+        for name in &opts.snippets {
+            let field = field_by_name(&schema, name)?;
+            let entry = schema.get_field_entry(field);
+            if !matches!(entry.field_type(), FieldType::Str(_)) || !entry.is_stored() {
+                return Err(format!(
+                    "snippets need a stored text field, '{name}' is not one"
+                ));
+            }
+            let mut g = SnippetGenerator::create(&searcher, &*q, field)
+                .map_err(err("cannot create snippet generator"))?;
+            if let Some(n) = opts.snippet_chars {
+                g.set_max_num_chars(n);
+            }
+            generators.push((name.as_str(), g));
+        }
+
         let top = searcher
-            .search(&q, &TopDocs::with_limit(limit.max(1)).order_by_score())
+            .search(&q, &TopDocs::with_limit(opts.limit.max(1)).order_by_score())
             .map_err(err("search failed"))?;
 
         let mut hits = Vec::with_capacity(top.len());
         for (score, addr) in top {
             let doc: TantivyDocument = searcher.doc(addr).map_err(err("cannot load document"))?;
-            let doc_val: Value =
-                serde_json::from_str(&doc.to_json(&schema)).map_err(err("cannot encode document"))?;
-            hits.push(serde_json::json!({ "score": score, "doc": flatten_single_values(doc_val) }));
+            let doc_val: Value = serde_json::from_str(&doc.to_json(&schema))
+                .map_err(err("cannot encode document"))?;
+            let mut hit =
+                serde_json::json!({ "score": score, "doc": flatten_single_values(doc_val) });
+            if !generators.is_empty() {
+                let mut snippets = Map::new();
+                for (name, g) in &generators {
+                    let mut snippet = g.snippet_from_doc(&doc);
+                    if let Some((pre, post)) = &opts.highlight {
+                        snippet.set_snippet_prefix_postfix(pre, post);
+                    }
+                    snippets.insert((*name).to_string(), Value::String(snippet.to_html()));
+                }
+                hit["snippets"] = Value::Object(snippets);
+            }
+            hits.push(hit);
         }
         into_c_string(Value::Array(hits).to_string())
+    })
+}
+
+/// Build an exact-match term for `field` from a JSON scalar. Only `string`
+/// (untokenized) and numeric fields qualify: a term on a tokenized text field
+/// would match every document containing that word.
+fn exact_term(schema: &Schema, name: &str, value: &Value) -> Res<Term> {
+    let field = field_by_name(schema, name)?;
+    let entry = schema.get_field_entry(field);
+    let as_text = match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        other => {
+            return Err(format!(
+                "field '{name}': key value must be a string or number, got {other}"
+            ));
+        }
+    };
+    let bad_num = |t: &str| format!("field '{name}': '{as_text}' is not a valid {t}");
+    match entry.field_type() {
+        FieldType::Str(opts) => {
+            let raw = opts
+                .get_indexing_options()
+                .is_some_and(|i| i.tokenizer() == "raw");
+            if !raw {
+                return Err(format!(
+                    "field '{name}' is a tokenized text field; delete/update need a 'string' or numeric key field"
+                ));
+            }
+            Ok(Term::from_field_text(field, &as_text))
+        }
+        FieldType::U64(_) => as_text
+            .trim()
+            .parse()
+            .map(|v| Term::from_field_u64(field, v))
+            .map_err(|_| bad_num("u64")),
+        FieldType::I64(_) => as_text
+            .trim()
+            .parse()
+            .map(|v| Term::from_field_i64(field, v))
+            .map_err(|_| bad_num("i64")),
+        FieldType::F64(_) => as_text
+            .trim()
+            .parse()
+            .map(|v| Term::from_field_f64(field, v))
+            .map_err(|_| bad_num("f64")),
+        _ => Err(format!("field '{name}' cannot be used as a key")),
+    }
+}
+
+/// Delete every document whose `field` equals the JSON scalar `value_json`.
+/// Takes effect on the next commit. Returns 0 / -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn st_index_delete_term(
+    h: *mut StIndex,
+    field: *const c_char,
+    value_json: *const c_char,
+) -> i32 {
+    guard(-1, || {
+        let h = unsafe { handle(h) }?;
+        let field = unsafe { req_str(field, "field") }?;
+        let value: Value = serde_json::from_str(unsafe { req_str(value_json, "value") }?)
+            .map_err(err("invalid key value"))?;
+        let term = exact_term(&h.index.schema(), field, &value)?;
+        h.writer()?.delete_term(term);
+        Ok(0)
     })
 }
 
