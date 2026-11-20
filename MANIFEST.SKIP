@@ -1,0 +1,7 @@
+#!include_default
+^\.git
+^\.github/
+^rust/target/
+^prebuilt/
+^MANIFEST\.SKIP$
+\.tar\.gz$

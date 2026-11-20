@@ -1,9 +1,11 @@
 Revision history for Search-Tantivy
 
-0.01  unreleased
+0.01  2026-11-21
       - First version: create/open index, add, commit, search, num_docs.
       - Field types text, string, u64, i64, f64; stored or index-only.
       - delete() and update() by an exact string or numeric key.
       - Highlighted, HTML-escaped snippets in search results
         (snippets, snippet_chars, highlight options).
       - GitHub Actions CI: Linux and macOS, Perl 5.26 and 5.40.
+      - Prebuilt, checksum-verified libraries for Linux (x86_64/aarch64,
+        glibc and musl), macOS and Windows: no Rust needed to install.

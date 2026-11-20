@@ -1,0 +1,174 @@
+name: Release
+
+# Push a tag vX.YY (matching $VERSION in lib/Search/Tantivy.pm) to:
+#   1. build the Rust library for every supported platform,
+#   2. publish them, their checksums and the CPAN tarball as a GitHub pre-release,
+#   3. install that tarball on clean machines without Rust,
+#   4. promote the pre-release to a release once every install works.
+# The tarball attached to the release is the one to upload to PAUSE.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: v
+        run: |
+          mod=$(perl -ne 'print $1 if /^our \$VERSION = .([\d._]+)./' lib/Search/Tantivy.pm)
+          [ "v$mod" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match module version $mod"; exit 1; }
+          echo "version=$mod" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,   os: ubuntu-latest,  zig: x86_64-unknown-linux-gnu.2.17,  ext: so }
+          - { target: aarch64-unknown-linux-gnu,  os: ubuntu-latest,  zig: aarch64-unknown-linux-gnu.2.17, ext: so }
+          - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest,  zig: x86_64-unknown-linux-musl,      ext: so, rustflags: "-C target-feature=-crt-static" }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest,  zig: aarch64-unknown-linux-musl,     ext: so, rustflags: "-C target-feature=-crt-static" }
+          - { target: aarch64-apple-darwin,       os: macos-latest,   ext: dylib }
+          - { target: x86_64-apple-darwin,        os: macos-latest,   ext: dylib }
+          - { target: x86_64-pc-windows-msvc,     os: windows-latest, ext: dll, rustflags: "-C target-feature=+crt-static" }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: ${{ matrix.target }}
+      - if: matrix.zig
+        uses: mlugg/setup-zig@v2
+      - if: matrix.zig
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build
+        shell: bash
+        working-directory: rust
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          if [ -n "${{ matrix.zig }}" ]; then
+            cargo zigbuild --release --target ${{ matrix.zig }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+      - name: Collect
+        shell: bash
+        run: |
+          case "${{ matrix.ext }}" in dll) src=search_tantivy.dll ;; *) src=libsearch_tantivy.${{ matrix.ext }} ;; esac
+          mkdir -p out
+          cp "rust/target/${{ matrix.target }}/release/$src" "out/search_tantivy-${{ matrix.target }}.${{ matrix.ext }}"
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lib-${{ matrix.target }}
+          path: out/*
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          pattern: lib-*
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          (cd out && sha256sum search_tantivy-* | sort -k2) > prebuilt.sha256
+          cat prebuilt.sha256
+          cp prebuilt.sha256 out/
+      - name: CPAN tarball
+        env:
+          SEARCH_TANTIVY_BUILD: source   # only to write the Makefile; nothing is built
+        run: |
+          perl Makefile.PL
+          make manifest
+          grep -qx prebuilt.sha256 MANIFEST
+          make dist
+          cp Search-Tantivy-${{ needs.version.outputs.version }}.tar.gz out/
+      - name: Release notes
+        run: |
+          awk 'NR>2 && /^[0-9]/{if (seen) exit; seen=1} seen' Changes > notes.md
+          cat >> notes.md <<'NOTES'
+
+          Install: `cpanm Search::Tantivy` (prebuilt library for Linux x86_64/aarch64 glibc and musl, macOS, Windows; other platforms build from source with Rust).
+          NOTES
+      - name: GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" out/* --prerelease --title "$GITHUB_REF_NAME" --notes-file notes.md
+
+  verify:
+    needs: [version, publish]
+    name: install without Rust - ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "Debian perl:5.40 image", os: ubuntu-latest, container: "perl:5.40" }
+          - { name: "Alpine (musl)",           os: ubuntu-latest, container: "alpine:3.22" }
+          - { name: "Ubuntu arm64",            os: ubuntu-24.04-arm }
+          - { name: "macOS",                   os: macos-latest }
+          - { name: "Windows Strawberry",      os: windows-latest }
+    env:
+      TARBALL: Search-Tantivy-${{ needs.version.outputs.version }}
+    steps:
+      - name: Alpine packages
+        if: matrix.container == 'alpine:3.22'
+        run: apk add --no-cache bash perl perl-dev perl-app-cpanminus build-base libffi-dev curl
+      - name: System Perl packages (arm64)
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: sudo apt-get update && sudo apt-get install -y libffi-platypus-perl libtest2-suite-perl
+      - uses: shogo82148/actions-setup-perl@v1
+        if: ${{ !matrix.container && matrix.os != 'ubuntu-24.04-arm' }}
+        with:
+          perl-version: "5.40"
+          distribution: ${{ runner.os == 'Windows' && 'strawberry' || 'default' }}
+      - name: Install dependencies
+        if: matrix.os != 'ubuntu-24.04-arm'
+        shell: bash
+        run: cpanm --notest FFI::Platypus Test2::V0
+      - name: Download the CPAN tarball from the release
+        shell: bash
+        run: |
+          curl -fsSL -o "$TARBALL.tar.gz" "https://github.com/${{ github.repository }}/releases/download/$GITHUB_REF_NAME/$TARBALL.tar.gz"
+          tar xzf "$TARBALL.tar.gz"
+      - name: Install from the prebuilt binary
+        shell: bash
+        working-directory: ${{ env.TARBALL }}
+        env:
+          SEARCH_TANTIVY_BUILD: binary   # fail instead of falling back to cargo
+        run: |
+          if [ -n "${{ matrix.container }}" ]; then ! command -v cargo; fi   # containers really have no Rust
+          make=$(perl -MConfig -e 'print $Config{make}')
+          perl Makefile.PL
+          $make
+          $make test
+
+  promote:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "${{ github.repository }}" --prerelease=false --latest

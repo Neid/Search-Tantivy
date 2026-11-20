@@ -28,15 +28,29 @@ $index->commit;
 
 Status: early, API may change.
 
-## Building
-
-Needs a Rust toolchain (`cargo`) and `FFI::Platypus` 2.x.
+## Installing
 
 ```sh
-perl Makefile.PL && make && make test
+cpanm Search::Tantivy
 ```
 
-During development: `cargo build --release --manifest-path rust/Cargo.toml && prove -l t`.
+No Rust needed on Linux (x86_64/aarch64, glibc 2.17+ or musl), macOS (Apple Silicon/Intel)
+and 64-bit Windows: `Makefile.PL` downloads the prebuilt library for your platform from the
+matching GitHub release and checks it against the SHA-256 checksums shipped inside the CPAN
+tarball. Elsewhere, or if the download fails, it builds from source with `cargo`.
+
+`SEARCH_TANTIVY_BUILD=source` always builds from source; `SEARCH_TANTIVY_BUILD=binary`
+fails rather than falling back.
+
+## Developing
+
+```sh
+cargo build --release --manifest-path rust/Cargo.toml && prove -l t
+```
+
+Releasing: bump `$VERSION` and `Changes`, push a `vX.YY` tag. The release workflow builds
+all platforms, publishes a GitHub release with the CPAN tarball, test-installs it on clean
+machines without Rust, then marks the release final. Upload that tarball to PAUSE.
 
 ## How it works
 
@@ -49,7 +63,6 @@ into Perl exceptions.
 
 - facets and sorting by fast fields
 - custom tokenizers and stemming (language support)
-- prebuilt binaries so installing does not require Rust
 
 ## License
 

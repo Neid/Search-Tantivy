@@ -16,3 +16,4 @@ tantivy = "0.27"
 
 [profile.release]
 lto = "thin"
+strip = true
