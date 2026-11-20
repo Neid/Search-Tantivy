@@ -1,0 +1,5 @@
+Revision history for Search-Tantivy
+
+0.01  unreleased
+      - First version: create/open index, add, commit, search, num_docs.
+      - Field types text, string, u64, i64, f64; stored or index-only.
