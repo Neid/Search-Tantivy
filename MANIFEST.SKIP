@@ -5,3 +5,5 @@
 ^prebuilt/
 ^MANIFEST\.SKIP$
 \.tar\.gz$
+^out/
+^notes\.md$

@@ -87,14 +87,14 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
-          path: out
+          path: ${{ runner.temp }}/out
           pattern: lib-*
           merge-multiple: true
       - name: Checksums
         run: |
-          (cd out && sha256sum search_tantivy-* | sort -k2) > prebuilt.sha256
+          (cd "$RUNNER_TEMP/out" && sha256sum search_tantivy-* | sort -k2) > prebuilt.sha256
           cat prebuilt.sha256
-          cp prebuilt.sha256 out/
+          cp prebuilt.sha256 "$RUNNER_TEMP/out/"
       - name: CPAN tarball
         env:
           SEARCH_TANTIVY_BUILD: source   # only to write the Makefile; nothing is built
@@ -103,18 +103,21 @@ jobs:
           make manifest
           grep -qx prebuilt.sha256 MANIFEST
           make dist
-          cp Search-Tantivy-${{ needs.version.outputs.version }}.tar.gz out/
+          tar tzf Search-Tantivy-*.tar.gz
+          size=$(stat -c %s Search-Tantivy-*.tar.gz)
+          [ "$size" -lt 1000000 ] || { echo "tarball is $size bytes, binaries leaked into it"; exit 1; }
+          cp Search-Tantivy-${{ needs.version.outputs.version }}.tar.gz "$RUNNER_TEMP/out/"
       - name: Release notes
         run: |
-          awk 'NR>2 && /^[0-9]/{if (seen) exit; seen=1} seen' Changes > notes.md
-          cat >> notes.md <<'NOTES'
+          awk 'NR>2 && /^[0-9]/{if (seen) exit; seen=1} seen' Changes > "$RUNNER_TEMP/notes.md"
+          cat >> "$RUNNER_TEMP/notes.md" <<'NOTES'
 
           Install: `cpanm Search::Tantivy` (prebuilt library for Linux x86_64/aarch64 glibc and musl, macOS, Windows; other platforms build from source with Rust).
           NOTES
       - name: GitHub pre-release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" out/* --prerelease --title "$GITHUB_REF_NAME" --notes-file notes.md
+        run: gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP"/out/* --prerelease --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
 
   verify:
     needs: [version, publish]
@@ -144,9 +147,11 @@ jobs:
         with:
           perl-version: "5.40"
           distribution: ${{ runner.os == 'Windows' && 'strawberry' || 'default' }}
-      - name: Install dependencies
-        if: matrix.os != 'ubuntu-24.04-arm'
-        shell: bash
+          install-modules-with: cpanm
+          install-modules-args: --notest
+          install-modules: FFI::Platypus Test2::V0
+      - name: Install dependencies (containers)
+        if: matrix.container
         run: cpanm --notest FFI::Platypus Test2::V0
       - name: Download the CPAN tarball from the release
         shell: bash
@@ -154,6 +159,7 @@ jobs:
           curl -fsSL -o "$TARBALL.tar.gz" "https://github.com/${{ github.repository }}/releases/download/$GITHUB_REF_NAME/$TARBALL.tar.gz"
           tar xzf "$TARBALL.tar.gz"
       - name: Install from the prebuilt binary
+        if: runner.os != 'Windows'
         shell: bash
         working-directory: ${{ env.TARBALL }}
         env:
@@ -164,6 +170,18 @@ jobs:
           perl Makefile.PL
           $make
           $make test
+      # Git for Windows' bash has its own perl on PATH; use cmd so Strawberry's perl and gmake run.
+      - name: Install from the prebuilt binary (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        working-directory: ${{ env.TARBALL }}
+        env:
+          SEARCH_TANTIVY_BUILD: binary
+        run: |
+          perl -V:make
+          perl Makefile.PL || exit /b 1
+          gmake || exit /b 1
+          gmake test || exit /b 1
 
   promote:
     needs: verify
