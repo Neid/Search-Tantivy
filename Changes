@@ -5,7 +5,8 @@ Revision history for Search-Tantivy
         (language option, or shorthand type 'text:pl'), and ascii_folding.
       - reload() to see commits made by other processes.
       - search() options default_operator (AND/OR) and boost (per field).
-      - examples/podsearch: index and search the POD of everything in @INC.
+      - examples/podsearch: index and search the POD of everything in @INC;
+        exact word forms rank above stemmed look-alikes, --exact disables stemming.
 
 0.02  2026-11-21
       - Add AI_DISCLOSURE.md.

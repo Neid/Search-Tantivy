@@ -31,22 +31,26 @@ GetOptions(
     'index'   => \my $build,
     'dir=s'   => \$dir,
     'n=i'     => \$limit,
+    'exact'   => \my $exact,
     'help|h'  => \my $help,
 ) or usage(2);
 usage(0) if $help;
 
 if ($build) { build_index($dir); exit 0 unless @ARGV }
 usage(2) unless @ARGV;
-search( $dir, "@ARGV" );
+search( $dir, "@ARGV", $exact );
 
 # ---------------------------------------------------------------------------
 
 sub usage {
     print <<"USAGE";
 usage: podsearch --index            index the POD of every module in \@INC
-       podsearch [-n N] QUERY       search it (tantivy query syntax:
+       podsearch [-n N] [--exact] QUERY
+                                    search it (tantivy query syntax:
                                     words, "phrases", AND/OR, title:word)
-options: --dir DIR (default $dir)
+options: --exact    match words exactly, no stemming
+                    (by default "sorting" also finds "sort"; exact matches rank first)
+         --dir DIR (default $dir)
 USAGE
     exit shift;
 }
@@ -67,6 +71,11 @@ sub build_index {
             module => 'string',
             title  => 'text:en',
             body   => 'text:en',
+            # Same text without stemming. English stemming is aggressive
+            # ("mechanize" and "mechanism" both become "mechan"), so exact
+            # matches get their own field and a ranking bonus.
+            { name => 'title_exact', type => 'text', stored => 0 },
+            { name => 'body_exact',  type => 'text', stored => 0 },
             path   => 'string',
         ],
     );
@@ -86,7 +95,14 @@ sub build_index {
                     return if $seen{$module};    # first in @INC wins, like require...
                     my ( $title, $body ) = read_pod($File::Find::name) or return;
                     $seen{$module} = 1;          # ...among copies that have POD (perl-base has stripped ones)
-                    $idx->add( { module => $module, title => $title, body => $body, path => $File::Find::name } );
+                    $idx->add( {
+                        module      => $module,
+                        title       => $title,
+                        body        => $body,
+                        title_exact => $title,
+                        body_exact  => $body,
+                        path        => $File::Find::name,
+                    } );
                     $files++;
                     $bytes += length $body;
                 },
@@ -154,7 +170,7 @@ sub strip_codes {
 }
 
 sub search {
-    my ( $dir, $query ) = @_;
+    my ( $dir, $query, $exact ) = @_;
     -d $dir or die "No index at $dir - run: podsearch --index\n";
     my $idx = Search::Tantivy->open($dir);
 
@@ -169,11 +185,14 @@ sub search {
     my @hits = $idx->search(
         $query,
         limit         => $limit,
-        fields        => [ 'module', 'title', 'body' ],
+        fields => $exact
+        ? [ 'module', 'title_exact', 'body_exact' ]
+        : [ 'module', 'title', 'body', 'title_exact', 'body_exact' ],
         snippets      => ['body'],
         snippet_chars => 160,
         default_operator => 'AND',                          # every word must match
-        boost            => { module => 5, title => 3 },    # name/title hits first
+        # name/title hits first; exact word forms above stemmed look-alikes
+        boost => { module => 5, title => 1, title_exact => 4, body_exact => 4 },
         highlight     => [ "\x{1}", "\x{2}" ],    # placeholders, replaced after unescaping
     );
     my $ms = ( time - $t0 ) * 1000;
