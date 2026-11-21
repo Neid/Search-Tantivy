@@ -31,8 +31,10 @@ Status: early, API may change.
 ## Installing
 
 ```sh
-cpanm Search::Tantivy
+cpanm https://github.com/Neid/Search-Tantivy/releases/download/v0.02/Search-Tantivy-0.02.tar.gz
 ```
+
+(Not on CPAN yet; this installs the release tarball straight from GitHub.)
 
 No Rust needed on Linux (x86_64/aarch64, glibc 2.17+ or musl), macOS (Apple Silicon/Intel)
 and 64-bit Windows: `Makefile.PL` downloads the prebuilt library for your platform from the

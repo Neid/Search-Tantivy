@@ -110,9 +110,9 @@ jobs:
       - name: Release notes
         run: |
           awk 'NR>2 && /^[0-9]/{if (seen) exit; seen=1} seen' Changes > "$RUNNER_TEMP/notes.md"
-          cat >> "$RUNNER_TEMP/notes.md" <<'NOTES'
+          cat >> "$RUNNER_TEMP/notes.md" <<NOTES
 
-          Install: `cpanm Search::Tantivy` (prebuilt library for Linux x86_64/aarch64 glibc and musl, macOS, Windows; other platforms build from source with Rust).
+          Install: \`cpanm https://github.com/Neid/Search-Tantivy/releases/download/${GITHUB_REF_NAME}/Search-Tantivy-${GITHUB_REF_NAME#v}.tar.gz\` (prebuilt library for Linux x86_64/aarch64 glibc and musl, macOS, Windows; other platforms build from source with Rust).
           NOTES
       - name: GitHub pre-release
         env:
