@@ -1,0 +1,193 @@
+#!/usr/bin/env perl
+# podsearch - full-text search over the Perl documentation installed on this machine.
+#
+#   podsearch --index            build the index from every .pm/.pod in @INC
+#   podsearch 'hash slice'       search it
+#   podsearch -n 5 'utf8 AND decode'
+#
+# Example for Search::Tantivy: an index built in one go from existing files,
+# English stemming ("sorting" finds "sort"), and highlighted snippets.
+
+use strict;
+use warnings;
+use utf8;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";    # run from a checkout without installing
+
+use File::Find ();
+use File::Path ();
+use File::Spec;
+use Getopt::Long qw(GetOptions);
+use Time::HiRes  qw(time);
+use Search::Tantivy;
+
+binmode STDOUT, ':encoding(UTF-8)';
+
+my $dir   = File::Spec->catdir( $ENV{XDG_CACHE_HOME} // File::Spec->catdir( $ENV{HOME} // '.', '.cache' ), 'podsearch' );
+my $limit = 10;
+GetOptions(
+    'index'   => \my $build,
+    'dir=s'   => \$dir,
+    'n=i'     => \$limit,
+    'help|h'  => \my $help,
+) or usage(2);
+usage(0) if $help;
+
+if ($build) { build_index($dir); exit 0 unless @ARGV }
+usage(2) unless @ARGV;
+search( $dir, "@ARGV" );
+
+# ---------------------------------------------------------------------------
+
+sub usage {
+    print <<"USAGE";
+usage: podsearch --index            index the POD of every module in \@INC
+       podsearch [-n N] QUERY       search it (tantivy query syntax:
+                                    words, "phrases", AND/OR, title:word)
+options: --dir DIR (default $dir)
+USAGE
+    exit shift;
+}
+
+sub build_index {
+    my ($dir) = @_;
+    my $t0 = time;
+
+    # Build next to the live index and swap it in at the end, so searches
+    # keep working while a rebuild (e.g. from cron) is running.
+    my $tmp = "$dir.new";
+    File::Path::remove_tree($tmp);
+    File::Path::make_path($tmp);
+
+    my $idx = Search::Tantivy->create(
+        path   => $tmp,
+        fields => [
+            module => 'string',
+            title  => 'text:en',
+            body   => 'text:en',
+            path   => 'string',
+        ],
+    );
+
+    my ( %seen, $files, $bytes );
+    for my $inc ( grep { !ref && -d } @INC ) {
+        File::Find::find(
+            {   no_chdir => 1,
+                wanted   => sub {
+                    return unless /\.(?:pm|pod)\z/ && -f;
+                    my $module = module_name( $inc, $File::Find::name ) // return;
+                    return if $seen{$module}++;    # first in @INC wins, like require
+                    my ( $title, $body ) = read_pod($File::Find::name) or return;
+                    $idx->add( { module => $module, title => $title, body => $body, path => $File::Find::name } );
+                    $files++;
+                    $bytes += length $body;
+                },
+            },
+            $inc
+        );
+    }
+    $idx->commit;
+    undef $idx;
+
+    File::Path::remove_tree($dir);
+    rename $tmp, $dir or die "cannot move $tmp to $dir: $!\n";
+    printf "Indexed %d documents (%.1f MB of POD text) in %.1fs -> %s\n",
+      $files // 0, ( $bytes // 0 ) / 1e6, time - $t0, $dir;
+}
+
+sub module_name {
+    my ( $inc, $file ) = @_;
+    my $rel = File::Spec->abs2rel( $file, $inc );
+    $rel =~ s/\.(?:pm|pod)\z// or return undef;
+    my @parts = File::Spec->splitdir($rel);
+    shift @parts if @parts == 2 && $parts[0] eq 'pod';    # pod/perlfunc.pod -> perlfunc
+    return undef if grep { !/\A\w+\z/ } @parts;    # skip auto/, t/, odd dirs
+    return join '::', @parts;
+}
+
+# Plain text of the POD in a file: (title from NAME, body), or () if none.
+sub read_pod {
+    my ($file) = @_;
+    open my $fh, '<:raw', $file or return;
+    my ( $in_pod, $section, $title, @body ) = (0, '');
+    while ( my $line = <$fh> ) {
+        if ( $line =~ /\A=(\w+)\s*(.*)/ ) {
+            my ( $cmd, $arg ) = ( $1, $2 );
+            if ( $cmd eq 'cut' ) { $in_pod = 0; next }
+            $in_pod = 1;
+            next if $cmd =~ /\A(?:pod|over|back|begin|end|for|encoding)\z/;
+            $section = $arg if $cmd eq 'head1';
+            push @body, $arg;
+            next;
+        }
+        next unless $in_pod;
+        push @body, $line;
+        $title //= $1 if $section =~ /\ANAME\b/ && $line =~ /\S.*?\s+-+\s+(.+)/;
+    }
+    return unless @body;
+    my $text = join '', @body;
+    utf8::decode($text);    # POD is UTF-8 or Latin-1; keep bytes if not valid UTF-8
+    $text = strip_codes($text);
+    $text =~ s/\s+/ /g;
+    $title = strip_codes( $title // '' );
+    utf8::decode($title);
+    return ( $title, $text );
+}
+
+# B<bold>, C<code>, L<text|target>, E<gt>, ... -> plain text
+sub strip_codes {
+    my ($s) = @_;
+    my %ent = ( lt => '<', gt => '>', verbar => '|', sol => '/', quot => '"', amp => '&' );
+    $s =~ s{E<(\w+)>}{$ent{$1} // ''}ge;
+    1 while $s =~ s/[A-Z]<<+\s+(.*?)\s+>>+/$1/gs;    # C<< $a->b >>
+    1 while $s =~ s/L<([^<>|]*)\|[^<>]*>/$1/g;       # L<text|target>
+    1 while $s =~ s/[A-Z]<([^<>]*)>/$1/g;
+    return $s;
+}
+
+sub search {
+    my ( $dir, $query ) = @_;
+    -d $dir or die "No index at $dir - run: podsearch --index\n";
+    my $idx = Search::Tantivy->open($dir);
+
+    # "Data::Dumper" would parse as field "Data"; search it as the exact
+    # module or as the phrase "data dumper" instead.
+    $query =~ s{\b(\w+(?:::\w+)+)\b}{my $m = $1; my $w = join ' ', split /::/, $m; qq{(module:"$m" OR "$w")}}ge;
+
+    my $tty = -t STDOUT;
+    my ( $on, $off ) = $tty ? ( "\e[1;33m", "\e[0m" ) : ( '*', '*' );
+
+    my $t0   = time;
+    my @hits = $idx->search(
+        $query,
+        limit         => $limit,
+        fields        => [ 'module', 'title', 'body' ],
+        snippets      => ['body'],
+        snippet_chars => 160,
+        default_operator => 'AND',                          # every word must match
+        boost            => { module => 5, title => 3 },    # name/title hits first
+        highlight     => [ "\x{1}", "\x{2}" ],    # placeholders, replaced after unescaping
+    );
+    my $ms = ( time - $t0 ) * 1000;
+
+    my $n = 0;
+    for my $hit (@hits) {
+        my $doc     = $hit->{doc};
+        my $snippet = unescape( $hit->{snippets}{body} );
+        $snippet =~ s/\x{1}/$on/g;
+        $snippet =~ s/\x{2}/$off/g;
+        printf "%2d. %s%s%s%s\n", ++$n, ( $tty ? "\e[1m" : '' ), $doc->{module}, ( $tty ? "\e[0m" : '' ),
+          ( length $doc->{title} ? " - $doc->{title}" : '' );
+        print "    $snippet\n" if length $snippet;
+        print "    perldoc $doc->{module}\n\n";
+    }
+    printf "%d result%s from %d documents in %.1f ms\n", scalar @hits, ( @hits == 1 ? '' : 's' ), $idx->num_docs, $ms;
+}
+
+sub unescape {
+    my ($s) = @_;
+    my %ent = ( amp => '&', lt => '<', gt => '>', quot => '"', '#x27' => "'", '#39' => "'" );
+    $s =~ s/&(amp|lt|gt|quot|#x27|#39);/$ent{$1}/g;
+    return $s;
+}

@@ -142,11 +142,15 @@ sub num_docs {
 sub search {
     my ( $self, $query, %opt ) = @_;
     defined $query or croak 'search: query is required';
-    my %known = map { $_ => 1 } qw(limit fields snippets snippet_chars highlight);
+    my %known = map { $_ => 1 } qw(limit fields snippets snippet_chars highlight default_operator boost);
     my @unknown = grep { !$known{$_} } sort keys %opt;
     croak "search: unknown option(s): @unknown" if @unknown;
     $opt{limit} += 0 if defined $opt{limit};
     $opt{snippet_chars} += 0 if defined $opt{snippet_chars};
+    if ( defined $opt{boost} ) {
+        ref $opt{boost} eq 'HASH' or croak 'search: boost must be a hash ref';
+        $opt{boost} = { map { $_ => 0 + $opt{boost}{$_} } keys %{ $opt{boost} } };
+    }
 
     my $ptr = _search( $self, $query, $JSON->encode( \%opt ) ) or _fail();
     my $json = $ffi->cast( 'opaque' => 'string', $ptr );
@@ -270,7 +274,10 @@ C<fields> (array ref of fields searched by terms without a C<field:> prefix;
 default: all text and string fields), C<snippets> (array ref of stored text
 fields to build highlighted excerpts for), C<snippet_chars> (maximum excerpt
 length, default 150) and C<highlight> (array ref C<< [$before, $after] >>,
-default C<< ['<b>', '</b>'] >>).
+default C<< ['<b>', '</b>'] >>), C<default_operator> (C<'OR'>, the default:
+any term may match, more matches rank higher; or C<'AND'>: every term must
+match) and C<boost> (hash ref of field => factor, e.g. C<< { title => 3 } >> to
+rank title matches above body matches).
 
 Returns a list of hash refs C<< { score => $float, doc => \%stored_fields } >>,
 best first. With C<snippets>, each hit also has C<< snippets => { $field => $html } >>:

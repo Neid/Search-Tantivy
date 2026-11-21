@@ -381,6 +381,10 @@ struct SearchOptions {
     snippet_chars: Option<usize>,
     /// Markup around highlighted terms, default `<b>` / `</b>`.
     highlight: Option<(String, String)>,
+    /// "OR" (default: any term may match) or "AND" (all terms must).
+    default_operator: Option<String>,
+    /// Score multiplier per field, e.g. {"title": 3.0}.
+    boost: std::collections::BTreeMap<String, f32>,
 }
 
 impl Default for SearchOptions {
@@ -391,6 +395,8 @@ impl Default for SearchOptions {
             snippets: Vec::new(),
             snippet_chars: None,
             highlight: None,
+            default_operator: None,
+            boost: Default::default(),
         }
     }
 }
@@ -432,7 +438,25 @@ pub unsafe extern "C" fn st_index_search(
                 .collect(),
         };
 
-        let parser = QueryParser::for_index(&h.index, fields);
+        let mut parser = QueryParser::for_index(&h.index, fields);
+        match opts
+            .default_operator
+            .as_deref()
+            .map(str::to_ascii_uppercase)
+            .as_deref()
+        {
+            None | Some("OR") => {}
+            Some("AND") => parser.set_conjunction_by_default(),
+            Some(other) => {
+                return Err(format!("default_operator must be AND or OR, got '{other}'"));
+            }
+        }
+        for (name, factor) in &opts.boost {
+            if !factor.is_finite() || *factor <= 0.0 {
+                return Err(format!("boost for '{name}' must be a positive number"));
+            }
+            parser.set_field_boost(field_by_name(&schema, name)?, *factor);
+        }
         let q = parser.parse_query(query).map_err(err("invalid query"))?;
         let searcher = h.reader.searcher();
 

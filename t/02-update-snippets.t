@@ -72,4 +72,21 @@ subtest 'snippets' => sub {
     like dies { $idx->search( 'x', colour => 'red' ) },        qr/unknown option\(s\): colour/, 'unknown option';
 };
 
+subtest 'default_operator and boost' => sub {
+    my $idx = new_index();
+    is scalar( my @or = $idx->search('perl rust') ), 3, 'OR by default: any term';
+    is [ map { $_->{doc}{url} } $idx->search( 'camel rust', default_operator => 'AND' ) ], [], 'AND: all terms';
+    is [ map { $_->{doc}{url} } $idx->search( 'camel perl', default_operator => 'and' ) ], ['/perl'], 'AND is case-insensitive';
+
+    my $idx2 = Search::Tantivy->create( fields => [ url => 'string', title => 'text', body => 'text' ] );
+    $idx2->add( { url => '/in-body',  title => 'Something else', body => 'about perl perl perl' } );
+    $idx2->add( { url => '/in-title', title => 'Perl',           body => 'a book' } );
+    $idx2->commit;
+    is( ( $idx2->search( 'perl', boost => { title => 10 } ) )[0]{doc}{url}, '/in-title', 'title boost wins' );
+
+    like dies { $idx->search( 'x', default_operator => 'XOR' ) }, qr/must be AND or OR/, 'bad operator';
+    like dies { $idx->search( 'x', boost => { title => -1 } ) },  qr/positive number/,   'bad boost';
+    like dies { $idx->search( 'x', boost => { nope => 2 } ) },    qr/unknown field 'nope'/, 'boost on unknown field';
+};
+
 done_testing;

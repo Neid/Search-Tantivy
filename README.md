@@ -28,6 +28,38 @@ $index->commit;
 
 Status: early, API may change.
 
+### Languages
+
+`text` fields can stem words for 19 languages, including Polish, and fold accents, so a
+search for `książka` finds *książki* and `zolw` finds *żółw*:
+
+```perl
+fields => [
+    title => 'text:en',
+    { name => 'body', type => 'text', language => 'polish', ascii_folding => 1 },
+]
+```
+
+### Example: search your Perl documentation
+
+[`examples/podsearch`](examples/podsearch) indexes the POD of every module in `@INC` and
+searches it with highlighted results (matches are bold in a terminal; the time
+includes opening the index):
+
+```
+$ examples/podsearch --index
+Indexed 653 documents (4.0 MB of POD text) in 0.2s -> /home/you/.cache/podsearch
+$ examples/podsearch -n 1 'json utf8'
+ 1. JSON - JSON (JavaScript Object Notation) encoder/decoder
+    for details). $perl_scalar = from_json($json_text, {utf8 => 1}) # => JSON->new->utf8(1)->decode($json_text) ...
+    perldoc JSON
+
+1 result from 653 documents in 20.6 ms
+```
+
+Run `podsearch --index` from cron to keep it current; searches keep working during a
+rebuild.
+
 ## Installing
 
 ```sh
@@ -64,7 +96,7 @@ into Perl exceptions.
 ## Roadmap
 
 - facets and sorting by fast fields
-- custom tokenizers and stemming (language support)
+- stop words per language
 
 ## AI disclosure
 
