@@ -1,5 +1,8 @@
 Revision history for Search-Tantivy
 
+0.02  2026-11-21
+      - Add AI_DISCLOSURE.md.
+
 0.01  2026-11-21
       - First version: create/open index, add, commit, search, num_docs.
       - Field types text, string, u64, i64, f64; stored or index-only.

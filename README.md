@@ -64,6 +64,10 @@ into Perl exceptions.
 - facets and sorting by fast fields
 - custom tokenizers and stemming (language support)
 
+## AI disclosure
+
+Developed with AI coding tools; see [AI_DISCLOSURE.md](AI_DISCLOSURE.md).
+
 ## License
 
 Same terms as Perl itself.
