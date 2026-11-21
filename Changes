@@ -1,5 +1,10 @@
 Revision history for Search-Tantivy
 
+0.03  unreleased
+      - Language-aware text fields: stemming for 19 languages incl. Polish
+        (language option, or shorthand type 'text:pl'), and ascii_folding.
+      - reload() to see commits made by other processes.
+
 0.02  2026-11-21
       - Add AI_DISCLOSURE.md.
 

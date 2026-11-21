@@ -22,6 +22,7 @@ $ffi->attach( [ st_index_create   => '_create' ]      => [ 'string', 'string' ] 
 $ffi->attach( [ st_index_open     => '_open' ]        => ['string']                             => 'st_index' );
 $ffi->attach( [ st_index_add_json => '_add_json' ]    => [ 'st_index', 'string' ]               => 'int' );
 $ffi->attach( [ st_index_commit   => '_commit' ]      => ['st_index']                           => 'int' );
+$ffi->attach( [ st_index_reload   => '_reload' ]      => ['st_index']                           => 'int' );
 $ffi->attach( [ st_index_num_docs => '_num_docs' ]    => ['st_index']                           => 'sint64' );
 $ffi->attach( [ st_index_search   => '_search' ]      => [ 'st_index', 'string', 'string' ]     => 'opaque' );
 $ffi->attach( [ st_index_delete_term => '_delete_term' ] => [ 'st_index', 'string', 'string' ] => 'int' );
@@ -63,17 +64,27 @@ sub create {
     my @list = @$fields;
     while (@list) {
         my $item = shift @list;
+        my %f;
         if ( ref $item eq 'HASH' ) {
-            push @spec, {
-                name   => $item->{name},
-                type   => $item->{type},
-                stored => ( exists $item->{stored} ? ( $item->{stored} ? JSON::PP::true : JSON::PP::false ) : JSON::PP::true ),
-            };
+            %f = %$item;
         }
         else {
             @list or croak "create: field '$item' has no type";
-            push @spec, { name => $item, type => shift @list, stored => JSON::PP::true };
+            %f = ( name => $item, type => shift @list );
         }
+        defined $f{type} or croak "create: field '" . ( $f{name} // '?' ) . "' has no type";
+        # shorthand: 'text:polish', 'text:en'
+        ( $f{type}, $f{language} ) = ( $1, $2 ) if $f{type} =~ /\A(text):(\w+)\z/;
+        my @unknown = grep { !/\A(?:name|type|stored|language|ascii_folding)\z/ } sort keys %f;
+        croak "create: field '$f{name}': unknown option(s): @unknown" if @unknown;
+
+        push @spec, {
+            name          => $f{name},
+            type          => $f{type},
+            stored        => ( !exists $f{stored} || $f{stored} ) ? JSON::PP::true : JSON::PP::false,
+            ascii_folding => $f{ascii_folding} ? JSON::PP::true : JSON::PP::false,
+            ( defined $f{language} ? ( language => $f{language} ) : () ),
+        };
     }
 
     my $self = _create( $args{path}, $JSON->encode( \@spec ) ) or _fail();
@@ -112,6 +123,12 @@ sub update {
 sub commit {
     my ($self) = @_;
     _commit($self) == 0 or _fail();
+    return $self;
+}
+
+sub reload {
+    my ($self) = @_;
+    _reload($self) == 0 or _fail();
     return $self;
 }
 
@@ -193,6 +210,31 @@ hash refs C<< { name => ..., type => ..., stored => 0|1 } >>. Fields are stored
 Types: C<text> (tokenized, full-text searchable), C<string> (indexed as one
 exact token, e.g. ids, URLs, tags), C<u64>, C<i64>, C<f64>.
 
+=head3 Language-aware text fields
+
+By default a C<text> field matches words exactly (case-insensitively). Give it
+a C<language> to match inflected forms too - C<run> finds I<running>, C<książka>
+finds I<książki>:
+
+    fields => [
+        title => 'text:en',                     # shorthand for language => 'en'
+        { name => 'body', type => 'text', language => 'polish', ascii_folding => 1 },
+    ]
+
+C<language> takes an ISO 639-1 code or English name: ar (arabic), da (danish),
+de (german), el (greek), en (english), es (spanish), fi (finnish), fr (french),
+hu (hungarian), it (italian), nl (dutch), no (norwegian), pl (polish),
+pt (portuguese), ro (romanian), ru (russian), sv (swedish), ta (tamil),
+tr (turkish). Polish uses the Yarovoy stemmer, the rest Snowball.
+
+C<ascii_folding> also maps accented letters to ASCII, so a query typed without
+diacritics finds the original (C<zolw> finds I<żółw>, C<creme> finds
+I<crème>). It works with or without C<language>; for Polish it switches to a
+stemmer designed for unaccented text.
+
+The analysis is fixed when the index is created; to change it, build a new
+index.
+
 =head2 open($path)
 
 Opens an existing on-disk index.
@@ -238,6 +280,18 @@ HTML-escaped; empty if the field did not match.
     my ($hit) = $index->search( 'camel', snippets => ['body'] );
     print $hit->{snippets}{body};   # The <b>camel</b> book about Perl 5 A field with one value is a plain scalar; a field with several
 values is an array ref.
+
+=head2 reload
+
+Picks up commits made by other processes (or other objects) on the same
+on-disk index since this one was opened or last reloaded. Your own
+L</commit> reloads automatically. A long-running searcher can call it
+periodically, or before each search when freshness matters:
+
+    # cron job:  $writer->update( id => $_ )->commit for @changed_rows;
+    # web app:   $searcher->reload; my @hits = $searcher->search($q);
+
+Only one process can write to an index at a time; any number can search it.
 
 =head2 num_docs
 

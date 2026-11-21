@@ -28,10 +28,13 @@ use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::document::Document as _;
 use tantivy::schema::{
-    Field, FieldType, NumericOptions, STORED, STRING, Schema, TEXT, TextOptions,
+    Field, FieldType, IndexRecordOption, NumericOptions, STORED, STRING, Schema, TEXT,
+    TextFieldIndexing, TextOptions,
 };
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+
+mod analyzers;
 
 const WRITER_HEAP_BYTES: usize = 50_000_000;
 
@@ -109,6 +112,7 @@ pub struct StIndex {
 
 impl StIndex {
     fn new(index: Index) -> Res<Self> {
+        analyzers::register_all(index.tokenizers());
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -148,6 +152,12 @@ struct FieldSpec {
     kind: String,
     #[serde(default = "default_true")]
     stored: bool,
+    /// Stemming language for `text` fields (ISO code or English name).
+    #[serde(default)]
+    language: Option<String>,
+    /// Fold accented characters to ASCII in `text` fields.
+    #[serde(default)]
+    ascii_folding: bool,
 }
 
 fn default_true() -> bool {
@@ -165,9 +175,35 @@ fn build_schema(json: &str) -> Res<Schema> {
             let o = NumericOptions::default().set_indexed().set_fast();
             if s.stored { o.set_stored() } else { o }
         };
+        if s.kind != "text" && (s.language.is_some() || s.ascii_folding) {
+            return Err(format!(
+                "field '{}': language and ascii_folding only apply to text fields",
+                s.name
+            ));
+        }
         match s.kind.as_str() {
             "text" => {
-                let o: TextOptions = if s.stored { TEXT | STORED } else { TEXT };
+                let code = match &s.language {
+                    None => None,
+                    Some(l) => Some(analyzers::language_code(l).ok_or_else(|| {
+                        format!(
+                            "field '{}': unsupported language '{l}' (supported: {})",
+                            s.name,
+                            analyzers::supported_languages()
+                        )
+                    })?),
+                };
+                let mut o: TextOptions = match analyzers::tokenizer_name(code, s.ascii_folding) {
+                    None => TEXT,
+                    Some(tok) => TextOptions::default().set_indexing_options(
+                        TextFieldIndexing::default()
+                            .set_tokenizer(&tok)
+                            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                    ),
+                };
+                if s.stored {
+                    o = o.set_stored();
+                }
                 b.add_text_field(&s.name, o);
             }
             "string" => {
@@ -309,6 +345,17 @@ pub unsafe extern "C" fn st_index_commit(h: *mut StIndex) -> i32 {
     guard(-1, || {
         let h = unsafe { handle(h) }?;
         h.writer()?.commit().map_err(err("commit failed"))?;
+        h.reader.reload().map_err(err("cannot reload reader"))?;
+        Ok(0)
+    })
+}
+
+/// See commits made by other processes (or other handles) since the last
+/// reload. Returns 0 / -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn st_index_reload(h: *mut StIndex) -> i32 {
+    guard(-1, || {
+        let h = unsafe { handle(h) }?;
         h.reader.reload().map_err(err("cannot reload reader"))?;
         Ok(0)
     })
