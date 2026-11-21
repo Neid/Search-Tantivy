@@ -29,6 +29,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         perl: ["5.40", "5.26"]
+        include:
+          - { os: windows-latest, perl: "5.40" }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -38,8 +40,15 @@ jobs:
       - uses: shogo82148/actions-setup-perl@v1
         with:
           perl-version: ${{ matrix.perl }}
+          distribution: ${{ runner.os == 'Windows' && 'strawberry' || 'default' }}
           install-modules-with: cpanm
           install-modules: FFI::Platypus Test2::V0
-      - run: perl Makefile.PL
-      - run: make
-      - run: make test
+      - if: runner.os != 'Windows'
+        run: perl Makefile.PL && make && make test
+      # cmd, not bash: Git for Windows' bash puts its own perl first on PATH
+      - if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          perl Makefile.PL || exit /b 1
+          gmake || exit /b 1
+          gmake test || exit /b 1

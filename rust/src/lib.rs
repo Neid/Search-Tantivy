@@ -315,7 +315,16 @@ pub unsafe extern "C" fn st_index_open(path: *const c_char) -> *mut StIndex {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn st_index_free(h: *mut StIndex) {
     if !h.is_null() {
-        let _ = catch_unwind(AssertUnwindSafe(|| drop(unsafe { Box::from_raw(h) })));
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let mut h = unsafe { Box::from_raw(h) };
+            // Let background merges finish so no segment file is still open
+            // when we return: on Windows an open file blocks renaming or
+            // deleting the index directory right after the object is gone.
+            if let Some(w) = h.writer.take() {
+                let _ = w.wait_merging_threads();
+            }
+            drop(h);
+        }));
     }
 }
 
