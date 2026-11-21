@@ -15,6 +15,7 @@ use utf8;
 use FindBin;
 use lib "$FindBin::Bin/../lib";    # run from a checkout without installing
 
+use Cwd ();
 use File::Find ();
 use File::Path ();
 use File::Spec;
@@ -70,15 +71,21 @@ sub build_index {
         ],
     );
 
+    # Resolve symlinks first: File::Find does not descend into a start
+    # directory that is a symlink (Debian's /usr/share/perl/5.40 -> 5.40.1).
+    my %dir_seen;
+    my @inc = grep { defined && !$dir_seen{$_}++ } map { Cwd::abs_path($_) } grep { !ref && -d } @INC;
+
     my ( %seen, $files, $bytes );
-    for my $inc ( grep { !ref && -d } @INC ) {
+    for my $inc (@inc) {
         File::Find::find(
             {   no_chdir => 1,
                 wanted   => sub {
                     return unless /\.(?:pm|pod)\z/ && -f;
                     my $module = module_name( $inc, $File::Find::name ) // return;
-                    return if $seen{$module}++;    # first in @INC wins, like require
+                    return if $seen{$module};    # first in @INC wins, like require...
                     my ( $title, $body ) = read_pod($File::Find::name) or return;
+                    $seen{$module} = 1;          # ...among copies that have POD (perl-base has stripped ones)
                     $idx->add( { module => $module, title => $title, body => $body, path => $File::Find::name } );
                     $files++;
                     $bytes += length $body;

@@ -48,13 +48,13 @@ includes opening the index):
 
 ```
 $ examples/podsearch --index
-Indexed 653 documents (4.0 MB of POD text) in 0.2s -> /home/you/.cache/podsearch
-$ examples/podsearch -n 1 'json utf8'
- 1. JSON - JSON (JavaScript Object Notation) encoder/decoder
-    for details). $perl_scalar = from_json($json_text, {utf8 => 1}) # => JSON->new->utf8(1)->decode($json_text) ...
-    perldoc JSON
+Indexed 1587 documents (17.5 MB of POD text) in 0.9s -> /home/you/.cache/podsearch
+$ examples/podsearch -n 1 'Data::Dumper'
+ 1. Data::Dumper - stringified perl data structures, suitable for both printing and eval
+    feasible $Data::Dumper::Indent = 0; # turn off all pretty print print Dumper($boo), "\n"; $Data: ...
+    perldoc Data::Dumper
 
-1 result from 653 documents in 20.6 ms
+1 result from 1587 documents in 9.1 ms
 ```
 
 Run `podsearch --index` from cron to keep it current; searches keep working during a
