@@ -63,7 +63,7 @@ rebuild.
 ## Installing
 
 ```sh
-cpanm https://github.com/Neid/Search-Tantivy/releases/download/v0.02/Search-Tantivy-0.02.tar.gz
+cpanm https://github.com/Neid/Search-Tantivy/releases/download/v0.03/Search-Tantivy-0.03.tar.gz
 ```
 
 (Not on CPAN yet; this installs the release tarball straight from GitHub.)

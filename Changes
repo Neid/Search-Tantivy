@@ -1,6 +1,6 @@
 Revision history for Search-Tantivy
 
-0.03  unreleased
+0.03  2026-11-22
       - Language-aware text fields: stemming for 19 languages incl. Polish
         (language option, or shorthand type 'text:pl'), and ascii_folding.
       - reload() to see commits made by other processes.
