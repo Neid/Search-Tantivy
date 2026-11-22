@@ -136,8 +136,8 @@ SQLite FTS5 (DBD::SQLite 1.78)           0.34       27.6        0.477     1719
 At this size both are fast: queries take well under a millisecond, and SQLite indexes
 somewhat faster. Search::Tantivy's index is about 40% smaller and its queries about
 30% faster. Both find the same 1719 matches. The difference that matters more is
-features: FTS5's only built-in stemmer is Porter (English), and it has no typo
-tolerance or sorting by field inside the search engine. Numbers from one laptop; run `examples/bench` on yours.
+features: FTS5's only built-in stemmer is Porter (English), so it has nothing for
+Polish or the other 17 languages, and it has no typo tolerance. Numbers from one laptop; run `examples/bench` on yours.
 
 ## How it works
 
