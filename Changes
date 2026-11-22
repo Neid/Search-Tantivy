@@ -1,5 +1,14 @@
 Revision history for Search-Tantivy
 
+0.06  2026-11-22
+      - Field option stop_words => 1 drops the language's stop words
+        (14 languages incl. Polish).
+      - examples/podsearch indexes each section (=head, and the entries of
+        perlfunc/perlvar) separately and shows each page once at its best
+        section: "sort numerically" now finds perlfunc's sort first. Prints
+        the matching perldoc command (perldoc -f sort).
+      - POD checked by the test suite (core Pod::Checker).
+
 0.05  2026-11-22
       - Sorting by numeric, date and string fields: search option
         sort => 'field' / '-field'. New string fields are sortable.

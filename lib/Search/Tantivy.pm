@@ -3,7 +3,7 @@ package Search::Tantivy;
 use strict;
 use warnings;
 
-our $VERSION = '0.05';
+our $VERSION = '0.06';
 
 use Carp qw(croak);
 use File::Basename ();
@@ -87,7 +87,7 @@ sub create {
         defined $f{type} or croak "create: field '" . ( $f{name} // '?' ) . "' has no type";
         # shorthand: 'text:polish', 'text:en'
         ( $f{type}, $f{language} ) = ( $1, $2 ) if $f{type} =~ /\A(text):(\w+)\z/;
-        my @unknown = grep { !/\A(?:name|type|stored|language|ascii_folding)\z/ } sort keys %f;
+        my @unknown = grep { !/\A(?:name|type|stored|language|ascii_folding|stop_words)\z/ } sort keys %f;
         croak "create: field '$f{name}': unknown option(s): @unknown" if @unknown;
 
         push @spec, {
@@ -95,6 +95,7 @@ sub create {
             type          => $f{type},
             stored        => ( !exists $f{stored} || $f{stored} ) ? JSON::PP::true : JSON::PP::false,
             ascii_folding => $f{ascii_folding} ? JSON::PP::true : JSON::PP::false,
+            stop_words    => $f{stop_words}    ? JSON::PP::true : JSON::PP::false,
             ( defined $f{language} ? ( language => $f{language} ) : () ),
         };
     }
@@ -283,6 +284,14 @@ C<ascii_folding> also maps accented letters to ASCII, so a query typed without
 diacritics finds the original (C<zolw> finds I<żółw>, C<creme> finds
 I<crème>). It works with or without C<language>; for Polish it switches to a
 stemmer designed for unaccented text.
+
+C<< stop_words => 1 >> (with a C<language>) leaves out the language's most
+common words (I<the>, I<and>, I<się>, I<nie>, ...): a smaller index, faster
+queries containing them, and rankings driven by the words that carry meaning.
+Phrase queries still match across the removed words. Lists exist for da, de,
+en, es, fi, fr, hu, it, nl, no, pl, pt, ru and sv.
+
+    { name => 'body', type => 'text', language => 'en', stop_words => 1 }
 
 The analysis is fixed when the index is created; to change it, build a new
 index.

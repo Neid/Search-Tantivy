@@ -60,26 +60,35 @@ search for `książka` finds *książki* and `zolw` finds *żółw*:
 ```perl
 fields => [
     title => 'text:en',
-    { name => 'body', type => 'text', language => 'polish', ascii_folding => 1 },
+    { name => 'body', type => 'text', language => 'polish', ascii_folding => 1, stop_words => 1 },
 ]
 ```
 
 ### Example: search your Perl documentation
 
 [`examples/podsearch`](examples/podsearch) indexes the POD of every module in `@INC` and
-searches it with highlighted results (matches are bold in a terminal; the time
-includes opening the index):
+searches it with highlighted results (matches are bold in a terminal):
 
 ```
 $ examples/podsearch --index
-Indexed 1587 documents (17.5 MB of POD text) in 0.9s -> /home/you/.cache/podsearch
-$ examples/podsearch -n 1 'Data::Dumper'
- 1. Data::Dumper - stringified perl data structures, suitable for both printing and eval
-    feasible $Data::Dumper::Indent = 0; # turn off all pretty print print Dumper($boo), "\n"; $Data: ...
-    perldoc Data::Dumper
+Indexed 1586 modules, 22610 sections (16.8 MB of POD text) in 2.1s -> /home/you/.cache/podsearch
+$ examples/podsearch -n 2 'sort numerically'
+ 1. perlfunc - Perl builtin functions
+    § sort SUBNAME LIST
+    sort SUBNAME LIST sort BLOCK LIST sort LIST In list context, this sorts the LIST and returns ...
+    perldoc -f sort
 
-1 of 59 matches (1587 documents) in 9.1 ms
+ 2. perl5160delta - what is new for perl v5.16.0
+    § The sort operator
+    sort now works once more with custom sort routines that are XSUBs. It stopped working in ...
+    perldoc perl5160delta
+
+2 pages shown, 80 matching sections (of 22610) in 1.5 ms
 ```
+
+Each section is indexed on its own (whole pages like perlfunc would otherwise rank
+below any short page mentioning the words), and each page is shown once, at its best
+section. `--fuzzy` tolerates typos, `--exact` turns stemming off.
 
 Run `podsearch --index` from cron to keep it current; searches keep working during a
 rebuild.
@@ -87,7 +96,7 @@ rebuild.
 ## Installing
 
 ```sh
-cpanm https://github.com/Neid/Search-Tantivy/releases/download/v0.05/Search-Tantivy-0.05.tar.gz
+cpanm https://github.com/Neid/Search-Tantivy/releases/download/v0.06/Search-Tantivy-0.06.tar.gz
 ```
 
 (Not on CPAN yet; this installs the release tarball straight from GitHub.)
@@ -135,7 +144,6 @@ into Perl exceptions.
 ## Roadmap
 
 - facets (counts per category)
-- stop words per language
 
 ## AI disclosure
 

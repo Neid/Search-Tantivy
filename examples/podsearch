@@ -69,16 +69,22 @@ sub build_index {
 
     my $idx = Search::Tantivy->create(
         path   => $tmp,
+        # One document per section (=head1..4; =item in perlfunc/perlvar):
+        # BM25 favours short documents, so a whole page like perlfunc would
+        # lose to any short page that mentions the words once.
         fields => [
-            module => 'string',
-            title  => 'text:en',
-            body   => 'text:en',
+            module  => 'string',
+            title   => 'text:en',    # the module's NAME line
+            section => 'text:en',    # heading of this section
+            body    => 'text:en',
             # Same text without stemming. English stemming is aggressive
             # ("mechanize" and "mechanism" both become "mechan"), so exact
             # matches get their own field and a ranking bonus.
-            { name => 'title_exact', type => 'text', stored => 0 },
-            { name => 'body_exact',  type => 'text', stored => 0 },
-            path   => 'string',
+            { name => 'title_exact',   type => 'text', stored => 0 },
+            { name => 'section_exact', type => 'text', stored => 0 },
+            { name => 'body_exact',    type => 'text', stored => 0 },
+            perldoc => 'string',     # command that shows it
+            path    => 'string',
         ],
     );
 
@@ -87,26 +93,33 @@ sub build_index {
     my %dir_seen;
     my @inc = grep { defined && !$dir_seen{$_}++ } map { Cwd::abs_path($_) } grep { !ref && -d } @INC;
 
-    my ( %seen, $files, $bytes );
+    my ( %seen, $files, $sections, $bytes );
     for my $inc (@inc) {
         File::Find::find(
             {   no_chdir => 1,
                 wanted   => sub {
                     return unless /\.(?:pm|pod)\z/ && -f;
                     my $module = module_name( $inc, $File::Find::name ) // return;
+                    return if $module eq 'perltoc';    # a table of contents repeats every heading
                     return if $seen{$module};    # first in @INC wins, like require...
-                    my ( $title, $body ) = read_pod($File::Find::name) or return;
+                    my ( $title, @sections ) = read_pod( $File::Find::name, $module =~ /\Aperl(?:func|var)\z/ ) or return;
                     $seen{$module} = 1;          # ...among copies that have POD (perl-base has stripped ones)
-                    $idx->add( {
-                        module      => $module,
-                        title       => $title,
-                        body        => $body,
-                        title_exact => $title,
-                        body_exact  => $body,
-                        path        => $File::Find::name,
-                    } );
+                    my @docs = map { {
+                        module        => $module,
+                        title         => $title,
+                        title_exact   => $title,
+                        section       => $_->{heading},
+                        # a search for the module's name should land on its NAME section
+                        section_exact => $_->{heading} =~ /\ANAME\z/ ? join( ' ', split /::/, $module ) : $_->{heading},
+                        body          => $_->{text},
+                        body_exact    => $_->{text},
+                        perldoc       => perldoc_command( $module, $_ ),
+                        path          => $File::Find::name,
+                    } } @sections;
+                    $idx->add_many( \@docs );
                     $files++;
-                    $bytes += length $body;
+                    $sections += @docs;
+                    $bytes += length $_->{text} for @sections;
                 },
             },
             $inc
@@ -117,8 +130,8 @@ sub build_index {
 
     File::Path::remove_tree($dir);
     rename $tmp, $dir or die "cannot move $tmp to $dir: $!\n";
-    printf "Indexed %d documents (%.1f MB of POD text) in %.1fs -> %s\n",
-      $files // 0, ( $bytes // 0 ) / 1e6, time - $t0, $dir;
+    printf "Indexed %d modules, %d sections (%.1f MB of POD text) in %.1fs -> %s\n",
+      $files // 0, $sections // 0, ( $bytes // 0 ) / 1e6, time - $t0, $dir;
 }
 
 sub module_name {
@@ -131,39 +144,66 @@ sub module_name {
     return join '::', @parts;
 }
 
-# Plain text of the POD in a file: (title from NAME, body), or () if none.
+# POD of a file as (title from NAME, sections), or () if it has none. Each
+# section is { heading, text, item }; with $split_items, top-level =item
+# entries (perlfunc's functions, perlvar's variables) are sections too.
 sub read_pod {
-    my ($file) = @_;
+    my ( $file, $split_items ) = @_;
     open my $fh, '<:raw', $file or return;
-    my ( $in_pod, $section, $title, @body ) = (0, '');
+    my ( $in_pod, $depth, $title, @sections ) = ( 0, 0 );
+    my $cur = { heading => '', text => '' };
+    my $new = sub { push @sections, $cur if $cur->{text} =~ /\S/; $cur = {@_} };
     while ( my $line = <$fh> ) {
-        if ( $line =~ /\A=(\w+)\s*(.*)/ ) {
-            my ( $cmd, $arg ) = ( $1, $2 );
+        if ( my ( $cmd, $arg ) = $line =~ /\A=(\w+)\s*(.*)/ ) {
             if ( $cmd eq 'cut' ) { $in_pod = 0; next }
             $in_pod = 1;
-            next if $cmd =~ /\A(?:pod|over|back|begin|end|for|encoding)\z/;
-            $section = $arg if $cmd eq 'head1';
-            push @body, $arg;
+            $depth++ if $cmd eq 'over';
+            $depth-- if $cmd eq 'back' && $depth;
+            if ( $cmd =~ /\Ahead[1-4]\z/ ) {
+                $new->( heading => $arg, text => "$arg\n" );
+            }
+            elsif ( $split_items && $cmd eq 'item' && $depth == 1 && $arg =~ /\A[\$\@%\w]/ ) {
+                # consecutive =items document one entry ("sort BLOCK LIST", "sort LIST")
+                if   ( $cur->{item} && !$cur->{content} ) { $cur->{text} .= "$arg\n" }
+                else                                     { $new->( heading => $arg, text => "$arg\n", item => 1 ) }
+            }
+            elsif ( $cmd !~ /\A(?:pod|over|back|begin|end|for|encoding)\z/ ) {
+                $cur->{text} .= "$arg\n";
+            }
             next;
         }
         next unless $in_pod;
-        push @body, $line;
-        $title //= $1 if $section =~ /\ANAME\b/ && $line =~ /\S.*?\s+-+\s+(.+)/;
+        $cur->{text} .= $line;
+        $cur->{content} ||= $line =~ s/X<[^>]*>//gr =~ /\S/;    # X<> are index entries, not text
+        $title //= $1 if $cur->{heading} =~ /\ANAME\b/ && $line =~ /\S.*?\s+-+\s+(.+)/;
     }
-    return unless @body;
-    my $text = join '', @body;
-    utf8::decode($text);    # POD is UTF-8 or Latin-1; keep bytes if not valid UTF-8
-    $text = strip_codes($text);
-    $text =~ s/\s+/ /g;
+    $new->();
+    return unless @sections;
+    for my $sec (@sections) {
+        for my $k (qw(heading text)) {
+            utf8::decode( $sec->{$k} );    # POD is UTF-8 or Latin-1; keep bytes if not valid UTF-8
+            $sec->{$k} = strip_codes( $sec->{$k} ) =~ s/\s+/ /gr =~ s/\A | \z//gr;
+        }
+    }
     $title = strip_codes( $title // '' );
     utf8::decode($title);
-    return ( $title, $text );
+    return ( $title, @sections );
+}
+
+sub perldoc_command {
+    my ( $module, $sec ) = @_;
+    if ( $sec->{item} ) {
+        my ($name) = $sec->{heading} =~ /\A(\S+)/;
+        return $module eq 'perlfunc' ? "perldoc -f $name" : "perldoc -v '$name'";
+    }
+    return "perldoc $module";
 }
 
 # B<bold>, C<code>, L<text|target>, E<gt>, ... -> plain text
 sub strip_codes {
     my ($s) = @_;
     my %ent = ( lt => '<', gt => '>', verbar => '|', sol => '/', quot => '"', amp => '&' );
+    $s =~ s/[XZ]<[^<>]*>//g;    # index entries, zero-width
     $s =~ s{E<(\w+)>}{$ent{$1} // ''}ge;
     1 while $s =~ s/[A-Z]<<+\s+(.*?)\s+>>+/$1/gs;    # C<< $a->b >>
     1 while $s =~ s/L<([^<>|]*)\|[^<>]*>/$1/g;       # L<text|target>
@@ -184,22 +224,28 @@ sub search {
     my ( $on, $off ) = $tty ? ( "\e[1;33m", "\e[0m" ) : ( '*', '*' );
 
     my $t0   = time;
-    my $res = $idx->search_page(
-        $query,
-        limit         => $limit,
+    # Several sections of one page often match; page through the hits and
+    # show each page once, at its best section.
+    my %opt = (
         fields => $exact
-        ? [ 'module', 'title_exact', 'body_exact' ]
-        : [ 'module', 'title', 'body', 'title_exact', 'body_exact' ],
+        ? [ 'module', 'title_exact', 'section_exact', 'body_exact' ]
+        : [ 'module', 'title', 'section', 'body', 'title_exact', 'section_exact', 'body_exact' ],
         snippets      => ['body'],
-        return_fields => [ 'module', 'title' ],    # skip the (large) body
+        return_fields => [ 'module', 'title', 'section', 'perldoc' ],    # skip the (large) body
         snippet_chars => 160,
         default_operator => 'AND',                          # every word must match
         # name/title hits first; exact word forms above stemmed look-alikes
-        boost => { module => 5, title => 1, title_exact => 4, body_exact => 4 },
+        boost => { module => 20, title => 1, title_exact => 4, section => 2, section_exact => 6, body_exact => 4 },
         highlight     => [ "\x{1}", "\x{2}" ],    # placeholders, replaced after unescaping
         ( $fuzzy ? ( fuzzy => 1 ) : () ),
     );
-    my @hits = @{ $res->{hits} };
+    my ( %shown, @hits, $res );
+    for ( my $offset = 0; @hits < $limit && $offset < 50 * $limit; $offset += 5 * $limit ) {
+        $res = $idx->search_page( $query, %opt, limit => 5 * $limit, offset => $offset );
+        push @hits, grep { !$shown{ $_->{doc}{module} }++ } @{ $res->{hits} };
+        last if $offset + 5 * $limit >= $res->{total};
+    }
+    splice @hits, $limit if @hits > $limit;
     my $ms = ( time - $t0 ) * 1000;
 
     my $n = 0;
@@ -210,11 +256,12 @@ sub search {
         $snippet =~ s/\x{2}/$off/g;
         printf "%2d. %s%s%s%s\n", ++$n, ( $tty ? "\e[1m" : '' ), $doc->{module}, ( $tty ? "\e[0m" : '' ),
           ( length $doc->{title} ? " - $doc->{title}" : '' );
+        print "    § $doc->{section}\n" if length $doc->{section} && $doc->{section} ne 'NAME';
         print "    $snippet\n" if length $snippet;
-        print "    perldoc $doc->{module}\n\n";
+        print "    $doc->{perldoc}\n\n";
     }
-    printf "%d of %d match%s (%d documents) in %.1f ms\n", scalar @hits, $res->{total},
-      ( $res->{total} == 1 ? '' : 'es' ), $idx->num_docs, $ms;
+    printf "%d page%s shown, %d matching section%s (of %d) in %.1f ms\n", scalar @hits, ( @hits == 1 ? '' : 's' ),
+      $res->{total}, ( $res->{total} == 1 ? '' : 's' ), $idx->num_docs, $ms;
 }
 
 sub unescape {

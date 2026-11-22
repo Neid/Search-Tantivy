@@ -77,4 +77,25 @@ subtest 'option errors' => sub {
     like dies { Search::Tantivy->create( fields => [ { name => 'b', type => 'text', langauge => 'en' } ] ) }, qr/unknown option\(s\): langauge/, 'typo in option name';
 };
 
+subtest 'stop words' => sub {
+    my $idx = Search::Tantivy->create( fields => [
+        id => 'u64',
+        { name => 'en', type => 'text', language => 'en', stop_words => 1 },
+        { name => 'pl', type => 'text', language => 'pl', stop_words => 1, ascii_folding => 1 },
+    ] );
+    $idx->add( { id => 1, en => 'The history of the camel', pl => 'Kot się nie boi psa' } );
+    $idx->add( { id => 2, en => 'A camel in the desert',    pl => 'Pies i kot' } );
+    $idx->commit;
+
+    is $idx->count('en:the'), 0, 'English stop word is not indexed';
+    is $idx->count( 'en:"history of the camel"' ), 1, 'phrases across stop words still match';
+    is $idx->count('pl:sie'), 0, 'Polish stop word, also without diacritics';
+    is $idx->count( 'kot', fields => ['pl'] ), 2, 'content words still indexed';
+
+    like dies { Search::Tantivy->create( fields => [ { name => 'b', type => 'text', stop_words => 1 } ] ) },
+      qr/stop_words needs a language/, 'needs a language';
+    like dies { Search::Tantivy->create( fields => [ { name => 'b', type => 'text', language => 'ta', stop_words => 1 } ] ) },
+      qr/no stop word list for language 'ta'/, 'language without a list';
+};
+
 done_testing;

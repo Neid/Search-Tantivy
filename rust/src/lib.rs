@@ -189,6 +189,9 @@ struct FieldSpec {
     /// Fold accented characters to ASCII in `text` fields.
     #[serde(default)]
     ascii_folding: bool,
+    /// Drop the language's stop words from `text` fields.
+    #[serde(default)]
+    stop_words: bool,
 }
 
 fn default_true() -> bool {
@@ -206,9 +209,9 @@ fn build_schema(json: &str) -> Res<Schema> {
             let o = NumericOptions::default().set_indexed().set_fast();
             if s.stored { o.set_stored() } else { o }
         };
-        if s.kind != "text" && (s.language.is_some() || s.ascii_folding) {
+        if s.kind != "text" && (s.language.is_some() || s.ascii_folding || s.stop_words) {
             return Err(format!(
-                "field '{}': language and ascii_folding only apply to text fields",
+                "field '{}': language, ascii_folding and stop_words only apply to text fields",
                 s.name
             ));
         }
@@ -224,14 +227,29 @@ fn build_schema(json: &str) -> Res<Schema> {
                         )
                     })?),
                 };
-                let mut o: TextOptions = match analyzers::tokenizer_name(code, s.ascii_folding) {
-                    None => TEXT,
-                    Some(tok) => TextOptions::default().set_indexing_options(
-                        TextFieldIndexing::default()
-                            .set_tokenizer(&tok)
-                            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-                    ),
-                };
+                if s.stop_words {
+                    match code {
+                        None => {
+                            return Err(format!("field '{}': stop_words needs a language", s.name));
+                        }
+                        Some(c) if !analyzers::has_stop_words(c) => {
+                            return Err(format!(
+                                "field '{}': no stop word list for language '{c}'",
+                                s.name
+                            ));
+                        }
+                        Some(_) => {}
+                    }
+                }
+                let mut o: TextOptions =
+                    match analyzers::tokenizer_name(code, s.ascii_folding, s.stop_words) {
+                        None => TEXT,
+                        Some(tok) => TextOptions::default().set_indexing_options(
+                            TextFieldIndexing::default()
+                                .set_tokenizer(&tok)
+                                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                        ),
+                    };
                 if s.stored {
                     o = o.set_stored();
                 }
