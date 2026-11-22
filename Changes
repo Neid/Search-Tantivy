@@ -1,5 +1,16 @@
 Revision history for Search-Tantivy
 
+0.05  2026-11-22
+      - Sorting by numeric, date and string fields: search option
+        sort => 'field' / '-field'. New string fields are sortable.
+      - date field type (epoch seconds, YYYY-MM-DD, RFC 3339; range queries).
+      - add_many(\@docs) adds a batch in one call.
+      - search option return_fields to return only some stored fields.
+      - Uses Cpanel::JSON::XS or JSON::XS when installed (big documents
+        decode 50x faster than with JSON::PP); SEARCH_TANTIVY_JSON overrides.
+      - examples/bench: indexing and query speed against SQLite FTS5 and
+        Lucy, whichever are installed.
+
 0.04  2026-11-22
       - search() option offset, search_page() returning hits plus the total
         number of matches, and count().

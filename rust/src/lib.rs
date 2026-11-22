@@ -36,17 +36,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
 use std::process;
 
-use tantivy::collector::{Count, TopDocs};
+use tantivy::collector::{Collector, Count, TopDocs};
 use tantivy::query::{
     BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, Query, QueryParser, TermQuery,
 };
 use tantivy::schema::document::Document as _;
 use tantivy::schema::{
-    Field, FieldType, IndexRecordOption, NumericOptions, STORED, STRING, Schema, TEXT,
-    TextFieldIndexing, TextOptions,
+    DateOptions, FAST, Field, FieldType, IndexRecordOption, NumericOptions, STORED, STRING, Schema,
+    TEXT, TextFieldIndexing, TextOptions,
 };
 use tantivy::snippet::SnippetGenerator;
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{
+    DateTime, DocAddress, Index, IndexReader, IndexWriter, Order, ReloadPolicy, Searcher,
+    TantivyDocument, Term,
+};
 
 mod analyzers;
 
@@ -235,8 +238,17 @@ fn build_schema(json: &str) -> Res<Schema> {
                 b.add_text_field(&s.name, o);
             }
             "string" => {
-                let o: TextOptions = if s.stored { STRING | STORED } else { STRING };
+                // FAST: sortable (column storage next to the inverted index).
+                let o: TextOptions = if s.stored {
+                    STRING | STORED | FAST
+                } else {
+                    STRING | FAST
+                };
                 b.add_text_field(&s.name, o);
+            }
+            "date" => {
+                let o = DateOptions::default().set_indexed().set_fast();
+                b.add_date_field(&s.name, if s.stored { o.set_stored() } else { o });
             }
             "u64" => {
                 b.add_u64_field(&s.name, numeric());
@@ -249,7 +261,7 @@ fn build_schema(json: &str) -> Res<Schema> {
             }
             other => {
                 return Err(format!(
-                    "field '{}': unknown type '{other}' (expected text, string, u64, i64 or f64)",
+                    "field '{}': unknown type '{other}' (expected text, string, u64, i64, f64 or date)",
                     s.name
                 ));
             }
@@ -258,10 +270,59 @@ fn build_schema(json: &str) -> Res<Schema> {
     Ok(b.build())
 }
 
+/// Dates as tantivy's JSON parser wants them (RFC 3339), from the forms Perl
+/// code tends to have: epoch seconds, "2024-05-01", "2024-05-01 12:30:00"
+/// (both taken as UTC), or RFC 3339 already.
+fn normalize_date(v: &Value) -> Option<Value> {
+    let rfc = |dt: DateTime| {
+        let secs = dt.into_timestamp_secs();
+        let odt = tantivy::time::OffsetDateTime::from_unix_timestamp(secs).ok()?;
+        odt.format(&tantivy::time::format_description::well_known::Rfc3339)
+            .ok()
+            .map(Value::String)
+    };
+    match v {
+        Value::Number(n) => rfc(DateTime::from_timestamp_secs(n.as_i64()?)),
+        Value::String(s) => {
+            let s = s.trim();
+            if let Ok(secs) = s.parse::<i64>() {
+                return rfc(DateTime::from_timestamp_secs(secs));
+            }
+            let b = s.as_bytes();
+            let looks_like_date = b.len() >= 10
+                && b[..10].iter().enumerate().all(|(i, c)| {
+                    if i == 4 || i == 7 {
+                        *c == b'-'
+                    } else {
+                        c.is_ascii_digit()
+                    }
+                });
+            if !looks_like_date {
+                return None;
+            }
+            match b.len() {
+                10 => Some(Value::String(format!("{s}T00:00:00Z"))),
+                19 if b[10] == b' ' || b[10] == b'T' => {
+                    Some(Value::String(format!("{}T{}Z", &s[..10], &s[11..])))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Perl hands numbers over as strings whenever a scalar was last used as a
-/// string; accept "1999" for numeric fields instead of failing.
+/// string; accept "1999" for numeric fields instead of failing. Dates get
+/// normalized too.
 fn coerce_numbers(schema: &Schema, doc: &mut Map<String, Value>) {
     fn coerce(v: &mut Value, ft: &FieldType) {
+        if matches!(ft, FieldType::Date(_)) && !v.is_array() {
+            if let Some(d) = normalize_date(v) {
+                *v = d;
+            }
+            return;
+        }
         match v {
             Value::Array(items) => items.iter_mut().for_each(|i| coerce(i, ft)),
             Value::String(s) => {
@@ -363,23 +424,46 @@ pub unsafe extern "C" fn st_index_free(h: *mut StIndex) {
     }
 }
 
+fn add_value(h: &mut StIndex, schema: &Schema, v: Value) -> Res<()> {
+    let Value::Object(mut map) = v else {
+        return Err("document must be a JSON object".into());
+    };
+    coerce_numbers(schema, &mut map);
+    let normalized = Value::Object(map).to_string();
+    let doc = TantivyDocument::parse_json(schema, &normalized).map_err(err("invalid document"))?;
+    h.writer()?
+        .add_document(doc)
+        .map_err(err("cannot add document"))?;
+    Ok(())
+}
+
 /// Add one document given as a JSON object. Returns 0 on success, -1 on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn st_index_add_json(h: *mut StIndex, doc_json: *const c_char) -> i32 {
     guard(-1, || {
         let h = unsafe { handle(h) }?;
         let json = unsafe { req_str(doc_json, "document") }?;
-        let schema = h.index.schema();
-        let mut map: Map<String, Value> =
-            serde_json::from_str(json).map_err(err("document must be a JSON object"))?;
-        coerce_numbers(&schema, &mut map);
-        let normalized = Value::Object(map).to_string();
-        let doc =
-            TantivyDocument::parse_json(&schema, &normalized).map_err(err("invalid document"))?;
-        h.writer()?
-            .add_document(doc)
-            .map_err(err("cannot add document"))?;
+        let v: Value = serde_json::from_str(json).map_err(err("document must be a JSON object"))?;
+        add_value(h, &h.index.schema(), v)?;
         Ok(0)
+    })
+}
+
+/// Add every document of a JSON array of objects. Returns the number added,
+/// or -1 (documents before the bad one stay added, uncommitted).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn st_index_add_many_json(h: *mut StIndex, docs_json: *const c_char) -> i64 {
+    guard(-1, || {
+        let h = unsafe { handle(h) }?;
+        let json = unsafe { req_str(docs_json, "documents") }?;
+        let docs: Vec<Value> =
+            serde_json::from_str(json).map_err(err("documents must be a JSON array"))?;
+        let schema = h.index.schema();
+        let n = docs.len();
+        for (i, v) in docs.into_iter().enumerate() {
+            add_value(h, &schema, v).map_err(|e| format!("document {i}: {e}"))?;
+        }
+        Ok(n as i64)
     })
 }
 
@@ -426,6 +510,10 @@ struct SearchOptions {
     count: bool,
     /// Edit distance (1 or 2) for typo-tolerant matching of query terms.
     fuzzy: u8,
+    /// Order by this fast field instead of relevance; "-field" = descending.
+    sort: Option<String>,
+    /// Stored fields to return in each hit (default: all).
+    return_fields: Option<Vec<String>>,
     /// Stored text fields to build highlighted snippets for.
     snippets: Vec<String>,
     snippet_chars: Option<usize>,
@@ -445,6 +533,8 @@ impl Default for SearchOptions {
             offset: 0,
             count: false,
             fuzzy: 0,
+            sort: None,
+            return_fields: None,
             snippets: Vec::new(),
             snippet_chars: None,
             highlight: None,
@@ -458,6 +548,111 @@ fn field_by_name(schema: &Schema, name: &str) -> Res<Field> {
     schema
         .get_field(name)
         .map_err(|_| format!("unknown field '{name}'"))
+}
+
+/// Top documents with their sort key (as JSON: the score, or the sort
+/// field's value) and optionally the total number of matches.
+type Collected = (Vec<(Value, DocAddress)>, Option<usize>);
+
+fn collect<K, C>(
+    searcher: &Searcher,
+    q: &dyn Query,
+    top: C,
+    count: bool,
+    key: impl Fn(K) -> Value,
+) -> Res<Collected>
+where
+    C: Collector<Fruit = Vec<(K, DocAddress)>>,
+{
+    let (top, total) = if count {
+        let (n, top) = searcher
+            .search(q, &(Count, top))
+            .map_err(err("search failed"))?;
+        (top, Some(n))
+    } else {
+        (
+            searcher.search(q, &top).map_err(err("search failed"))?,
+            None,
+        )
+    };
+    Ok((top.into_iter().map(|(k, a)| (key(k), a)).collect(), total))
+}
+
+fn date_value(d: DateTime) -> Value {
+    normalize_date(&Value::from(d.into_timestamp_secs())).unwrap_or(Value::Null)
+}
+
+/// Run the query with the requested order. Hits carry their sort key.
+fn top_docs(
+    searcher: &Searcher,
+    schema: &Schema,
+    q: &dyn Query,
+    opts: &SearchOptions,
+) -> Res<Collected> {
+    if opts.limit == 0 {
+        let total = if opts.count {
+            Some(searcher.search(q, &Count).map_err(err("search failed"))?)
+        } else {
+            None
+        };
+        return Ok((Vec::new(), total));
+    }
+    let top = TopDocs::with_limit(opts.limit).and_offset(opts.offset);
+    let Some(spec) = &opts.sort else {
+        return collect(searcher, q, top.order_by_score(), opts.count, |s: f32| {
+            Value::from(s)
+        });
+    };
+    let (name, order) = match spec.strip_prefix('-') {
+        Some(n) => (n, Order::Desc),
+        None => (spec.as_str(), Order::Asc),
+    };
+    let entry = schema.get_field_entry(field_by_name(schema, name)?);
+    if !entry.is_fast() {
+        return Err(format!(
+            "cannot sort by '{name}': only numeric, date and string fields are sortable \
+             (string fields of indexes made before version 0.05 are not; rebuild the index)"
+        ));
+    }
+    let c = opts.count;
+    match entry.field_type() {
+        FieldType::U64(_) => collect(
+            searcher,
+            q,
+            top.order_by_fast_field::<u64>(name, order),
+            c,
+            |v| v.map_or(Value::Null, Value::from),
+        ),
+        FieldType::I64(_) => collect(
+            searcher,
+            q,
+            top.order_by_fast_field::<i64>(name, order),
+            c,
+            |v| v.map_or(Value::Null, Value::from),
+        ),
+        FieldType::F64(_) => collect(
+            searcher,
+            q,
+            top.order_by_fast_field::<f64>(name, order),
+            c,
+            |v| v.map_or(Value::Null, Value::from),
+        ),
+        FieldType::Date(_) => collect(
+            searcher,
+            q,
+            top.order_by_fast_field::<DateTime>(name, order),
+            c,
+            |v| v.map_or(Value::Null, date_value),
+        ),
+        FieldType::Str(_) => collect(
+            searcher,
+            q,
+            top.order_by_string_fast_field(name, order),
+            c,
+            |v| v.map_or(Value::Null, Value::String),
+        ),
+        _ => Err(format!("cannot sort by '{name}'")),
+    }
 }
 
 /// Text fields the query parser would make fuzzy (tokenized or raw strings).
@@ -621,37 +816,28 @@ pub unsafe extern "C" fn st_index_search(
             generators.push((name.as_str(), g));
         }
 
-        let (top, total) = match (opts.limit, opts.count) {
-            (0, false) => (Vec::new(), None),
-            (0, true) => {
-                let n = searcher.search(&q, &Count).map_err(err("search failed"))?;
-                (Vec::new(), Some(n))
-            }
-            (limit, count) => {
-                let top_docs = TopDocs::with_limit(limit)
-                    .and_offset(opts.offset)
-                    .order_by_score();
-                if count {
-                    let (n, top) = searcher
-                        .search(&q, &(Count, top_docs))
-                        .map_err(err("search failed"))?;
-                    (top, Some(n))
-                } else {
-                    let top = searcher
-                        .search(&q, &top_docs)
-                        .map_err(err("search failed"))?;
-                    (top, None)
+        let (top, total) = top_docs(&searcher, &schema, &*q, &opts)?;
+        let keep: Option<BTreeSet<&str>> = match &opts.return_fields {
+            None => None,
+            Some(names) => {
+                for n in names {
+                    field_by_name(&schema, n)?;
                 }
+                Some(names.iter().map(String::as_str).collect())
             }
         };
 
         let mut hits = Vec::with_capacity(top.len());
-        for (score, addr) in top {
+        let sort_key = if opts.sort.is_some() { "sort" } else { "score" };
+        for (key, addr) in top {
             let doc: TantivyDocument = searcher.doc(addr).map_err(err("cannot load document"))?;
-            let doc_val: Value = serde_json::from_str(&doc.to_json(&schema))
+            let mut doc_val: Value = serde_json::from_str(&doc.to_json(&schema))
                 .map_err(err("cannot encode document"))?;
-            let mut hit =
-                serde_json::json!({ "score": score, "doc": flatten_single_values(doc_val) });
+            if let (Some(keep), Value::Object(m)) = (&keep, &mut doc_val) {
+                m.retain(|k, _| keep.contains(k.as_str()));
+            }
+            let mut hit = serde_json::json!({ "doc": flatten_single_values(doc_val) });
+            hit[sort_key] = key;
             if !generators.is_empty() {
                 let mut snippets = Map::new();
                 for (name, g) in &generators {

@@ -191,6 +191,7 @@ sub search {
         ? [ 'module', 'title_exact', 'body_exact' ]
         : [ 'module', 'title', 'body', 'title_exact', 'body_exact' ],
         snippets      => ['body'],
+        return_fields => [ 'module', 'title' ],    # skip the (large) body
         snippet_chars => 160,
         default_operator => 'AND',                          # every word must match
         # name/title hits first; exact word forms above stemmed look-alikes

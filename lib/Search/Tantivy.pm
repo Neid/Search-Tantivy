@@ -3,7 +3,7 @@ package Search::Tantivy;
 use strict;
 use warnings;
 
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 
 use Carp qw(croak);
 use File::Basename ();
@@ -11,7 +11,13 @@ use File::Spec ();
 use FFI::Platypus 2.00;
 use JSON::PP ();
 
-my $JSON = JSON::PP->new->utf8->canonical->allow_nonref;
+# Documents can be large (whole articles); an XS JSON module decodes them an
+# order of magnitude faster than JSON::PP, so use one when it is installed.
+my $JSON_CLASS = $ENV{SEARCH_TANTIVY_JSON}
+  // ( grep { eval "require $_; 1" } qw(Cpanel::JSON::XS JSON::XS) )[0] // 'JSON::PP';
+$JSON_CLASS =~ /\A(?:Cpanel::JSON::XS|JSON::XS|JSON::PP)\z/ or croak "Search::Tantivy: unsupported SEARCH_TANTIVY_JSON '$JSON_CLASS'";
+eval "require $JSON_CLASS; 1" or die $@;
+my $JSON = $JSON_CLASS->new->utf8->canonical->allow_nonref;
 
 my $ffi = FFI::Platypus->new( api => 2 );
 $ffi->lib( _find_lib() );
@@ -21,6 +27,7 @@ $ffi->attach( [ st_last_error     => '_last_error' ]  => []                     
 $ffi->attach( [ st_index_create   => '_create' ]      => [ 'string', 'string' ]                 => 'st_index' );
 $ffi->attach( [ st_index_open     => '_open' ]        => ['string']                             => 'st_index' );
 $ffi->attach( [ st_index_add_json => '_add_json' ]    => [ 'st_index', 'string' ]               => 'int' );
+$ffi->attach( [ st_index_add_many_json => '_add_many_json' ] => [ 'st_index', 'string' ]    => 'sint64' );
 $ffi->attach( [ st_index_commit   => '_commit' ]      => ['st_index']                           => 'int' );
 $ffi->attach( [ st_index_reload   => '_reload' ]      => ['st_index']                           => 'int' );
 $ffi->attach( [ st_index_num_docs => '_num_docs' ]    => ['st_index']                           => 'sint64' );
@@ -110,6 +117,14 @@ sub add {
     return $self;
 }
 
+sub add_many {
+    my ( $self, $docs ) = @_;
+    ref $docs eq 'ARRAY' or croak 'add_many: documents must be an array ref';
+    ref $_ eq 'HASH' or croak 'add_many: every document must be a hash ref' for @$docs;
+    _add_many_json( $self, $JSON->encode($docs) ) >= 0 or _fail();
+    return $self;
+}
+
 sub delete {
     my ( $self, $field, $value ) = @_;
     defined $field && defined $value or croak 'delete: field and value are required';
@@ -147,7 +162,7 @@ sub num_docs {
 sub _run_search {
     my ( $self, $method, $internal, $query, %opt ) = @_;
     defined $query or croak "$method: query is required";
-    my %known = map { $_ => 1 } qw(limit offset fields snippets snippet_chars highlight default_operator boost fuzzy);
+    my %known = map { $_ => 1 } qw(limit offset fields snippets snippet_chars highlight default_operator boost fuzzy sort return_fields);
     my @unknown = grep { !$known{$_} } sort keys %opt;
     croak "$method: unknown option(s): @unknown" if @unknown;
     for my $n (qw(limit offset snippet_chars fuzzy)) {
@@ -178,7 +193,7 @@ sub search_page {
 
 sub count {
     my ( $self, $query, %opt ) = @_;
-    my @not = grep { exists $opt{$_} } qw(limit offset snippets snippet_chars highlight);
+    my @not = grep { exists $opt{$_} } qw(limit offset snippets snippet_chars highlight sort return_fields);
     croak "count: option(s) not used for counting: @not" if @not;
     return $self->_run_search( count => { limit => 0, count => JSON::PP::true }, $query, %opt )->{total};
 }
@@ -237,7 +252,15 @@ hash refs C<< { name => ..., type => ..., stored => 0|1 } >>. Fields are stored
 (returned in search results) unless C<stored> is false.
 
 Types: C<text> (tokenized, full-text searchable), C<string> (indexed as one
-exact token, e.g. ids, URLs, tags), C<u64>, C<i64>, C<f64>.
+exact token, e.g. ids, URLs, tags), C<u64>, C<i64>, C<f64>, C<date>.
+
+C<date> values can be given as epoch seconds, C<"2024-05-01">,
+C<"2024-05-01 12:30:00"> (both read as UTC) or RFC 3339
+(C<"2024-05-01T12:30:00+02:00">); they are stored with second precision and
+returned as RFC 3339 in UTC (C<"2024-05-01T10:30:00Z">). Query them with
+ranges in RFC 3339: C<published:[2024-01-01T00:00:00Z TO 2025-01-01T00:00:00Z]>.
+
+Numeric, date and C<string> fields can be used to L<sort|/Sorting> results.
 
 =head3 Language-aware text fields
 
@@ -273,6 +296,13 @@ Opens an existing on-disk index.
 Adds a document. Numeric fields accept numbers or numeric strings. Documents
 are not searchable until L</commit>.
 
+=head2 add_many(\@docs)
+
+Adds several documents in one call, which is faster than calling L</"add(\%doc)"> for
+each (about 25% for small documents: most of the cost is encoding them).
+If one is invalid, the method croaks naming its position in the list; the
+documents before it have been added (and, as always, wait for L</commit>).
+
 =head2 delete($field, $value)
 
 Deletes every document whose C<$field> equals C<$value>. The field must be a
@@ -297,6 +327,9 @@ Runs a query in tantivy's query language (C<perl AND camel>, C<title:rust>,
 C<"exact phrase">, C<year:[2000 TO 2020]>). Options: C<limit> (default 10),
 C<offset> (number of best hits to skip, for pages after the first; see also
 L</"search_page($query, %opt)">), C<fuzzy> (see L</Typo tolerance>),
+C<sort> (see L</Sorting>), C<return_fields> (array ref of the stored fields to
+put in each hit's C<doc>, default all; leave out large fields you do not
+display - snippets can still be built from them),
 C<fields> (array ref of fields searched by terms without a C<field:> prefix;
 default: all text and string fields), C<snippets> (array ref of stored text
 fields to build highlighted excerpts for), C<snippet_chars> (maximum excerpt
@@ -326,6 +359,18 @@ above near misses, snippets highlight the words that actually matched, and
 phrases (C<"...">) stay exact. On stemmed fields the edit distance is measured
 between stems. Short words have many neighbours at distance 2, so 1 is the
 better default for user-typed queries.
+
+=head3 Sorting
+
+C<< sort => 'field' >> orders hits by a numeric, date or C<string> field,
+smallest first; C<< sort => '-field' >> largest (newest) first. Each hit then
+has C<< sort => $value >> instead of C<score>. Documents without a value come
+last.
+
+    my @latest = $index->search( 'perl', sort => '-published', limit => 20 );
+
+Use C<*> as the query to sort all documents. (C<string> fields of indexes
+created before version 0.05 cannot be sorted; rebuild those.)
 
 =head2 search_page($query, %opt)
 
@@ -378,10 +423,21 @@ created by C<fork()>): open the index again inside the thread.
 
 All methods C<croak> with a message from tantivy on failure.
 
+=head1 PERFORMANCE
+
+Results cross from Rust to Perl as JSON. If L<Cpanel::JSON::XS> or
+L<JSON::XS> is installed it is used, otherwise the pure-Perl L<JSON::PP>,
+which is much slower on large documents (returning 10 hits with
+10 KB bodies: 0.3 ms vs. 20 ms). Without an XS module, use C<return_fields>
+to return only what you display.
+
 =head1 ENVIRONMENT
 
 C<SEARCH_TANTIVY_LIB> - full path of the compiled Rust library, overriding the
 built-in lookup.
+
+C<SEARCH_TANTIVY_JSON> - C<Cpanel::JSON::XS>, C<JSON::XS> or C<JSON::PP>, to
+choose the JSON module instead of the first one installed.
 
 =head1 AUTHOR
 

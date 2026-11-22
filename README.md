@@ -31,12 +31,26 @@ print "$page->{total} results\n";
 
 # typo tolerance: "mechanzie" finds "mechanize"
 my @hits = $index->search('mechanzie', fuzzy => 1);
+
+# newest first (numeric, date and string fields sort; dates take epoch or ISO)
+my @latest = $index->search('perl', sort => '-year', limit => 20);
 ```
 
 Safe with preforking servers (Starman, mod_perl): open the index in the parent and
 search in the children. See *FORK AND THREADS* in the POD for writing.
 
 Status: early, API may change.
+
+### Why
+
+Perl's own full-text engines have aged out: [Lucy](https://metacpan.org/pod/Lucy)
+(formerly KinoSearch) was retired by Apache in 2018 and is no longer developed, and
+Plucene predates it. The usual alternatives are a search server (Elasticsearch,
+OpenSearch, Solr) to run and operate, or SQLite FTS5, which is easy but basic in
+ranking, stemming and query syntax. Search::Tantivy embeds
+[tantivy](https://github.com/quickwit-oss/tantivy), a maintained engine with
+Lucene-style queries, BM25 ranking, stemming in 19 languages, fuzzy matching, sorting
+and snippets, and installs as a normal CPAN-style module with a prebuilt library.
 
 ### Languages
 
@@ -73,7 +87,7 @@ rebuild.
 ## Installing
 
 ```sh
-cpanm https://github.com/Neid/Search-Tantivy/releases/download/v0.04/Search-Tantivy-0.04.tar.gz
+cpanm https://github.com/Neid/Search-Tantivy/releases/download/v0.05/Search-Tantivy-0.05.tar.gz
 ```
 
 (Not on CPAN yet; this installs the release tarball straight from GitHub.)
@@ -96,6 +110,21 @@ Releasing: bump `$VERSION` and `Changes`, push a `vX.YY` tag. The release workfl
 all platforms, publishes a GitHub release with the CPAN tarball, test-installs it on clean
 machines without Rust, then marks the release final. Upload that tarball to PAUSE.
 
+## Benchmark
+
+[`examples/bench`](examples/bench) indexes the same POD corpus with every engine it
+finds (Search::Tantivy, SQLite FTS5 via DBD::SQLite, Lucy) and times indexing and
+queries (top 10 + total count, all words required):
+
+```
+$ examples/bench
+Corpus: 1587 documents, 17.7 MB of text (POD in @INC)
+engine                              index (s)  size (MB)   query (ms)     hits
+Search::Tantivy 0.05                     0.45       15.5        0.289     1652
+```
+
+Numbers from one laptop; run it on yours.
+
 ## How it works
 
 `rust/` is a `cdylib` exposing a small C API (`st_index_create`, `st_index_add_json`,
@@ -105,7 +134,7 @@ into Perl exceptions.
 
 ## Roadmap
 
-- facets and sorting by fast fields
+- facets (counts per category)
 - stop words per language
 
 ## AI disclosure

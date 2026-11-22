@@ -1,0 +1,193 @@
+#!/usr/bin/env perl
+# bench - index the POD installed on this machine with every full-text engine
+# available to Perl here, and compare indexing time, index size and query time.
+#
+#   examples/bench            # Search::Tantivy, plus SQLite FTS5 (DBD::SQLite)
+#                             # and Lucy when they are installed
+#   examples/bench -q 500     # more query repetitions
+#
+# The corpus is the same as examples/podsearch: one document per module with
+# POD, so anyone can reproduce the numbers on their own machine.
+
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use Cwd ();
+use File::Find ();
+use File::Spec;
+use File::Temp ();
+use Getopt::Long qw(GetOptions);
+use Time::HiRes  qw(time);
+
+GetOptions( 'q=i' => \( my $reps = 200 ) ) or die "usage: bench [-q REPETITIONS]\n";
+
+my @QUERIES = ( 'hash', 'regular expression', 'utf8 decode', 'socket timeout', 'sort numerically', 'file' );
+
+my $docs = load_corpus();
+my $mb   = 0;
+$mb += length $_->{body} for @$docs;
+printf "Corpus: %d documents, %.1f MB of text (POD in \@INC)\n", scalar @$docs, $mb / 1e6;
+printf "Queries (%d runs each; top 10 module names by relevance + total count, all words required): %s\n\n", $reps, join ', ', map {"'$_'"} @QUERIES;
+
+my @engines = (
+    [ 'Search::Tantivy ' . ( eval { require Search::Tantivy; $Search::Tantivy::VERSION } // '' ), \&tantivy ],
+    [ 'SQLite FTS5 (DBD::SQLite ' . ( eval { require DBD::SQLite; $DBD::SQLite::VERSION } // '' ) . ')', \&fts5 ],
+    [ 'Lucy ' . ( eval { require Lucy; $Lucy::VERSION } // '' ), \&lucy ],
+);
+
+printf "%-34s %10s %10s %12s %8s\n", 'engine', 'index (s)', 'size (MB)', 'query (ms)', 'hits';
+for my $e (@engines) {
+    my ( $name, $run ) = @$e;
+    my $dir = File::Temp->newdir;
+    my $r   = eval { $run->( "$dir", $docs ) };
+    if ( !$r ) {
+        my $why = $@ =~ /Can't locate (\S+)/ ? "not installed ($1)" : "failed: $@";
+        printf "%-34s %s\n", $name, $why =~ s/\s+\z//r;
+        next;
+    }
+    printf "%-34s %10.2f %10.1f %12.3f %8d\n", $name, $r->{index_s}, dir_size("$dir") / 1e6, $r->{query_ms}, $r->{hits};
+}
+print "\nquery (ms): mean time per query, averaged over all queries and runs.\n",
+  "hits: total matches for all queries (engines tokenize and stem differently).\n";
+
+# --- engines ---------------------------------------------------------------
+
+sub timed_queries {
+    my ($search) = @_;    # $search->($q) returns the number of matches
+    my $hits = 0;
+    $hits += $search->($_) for @QUERIES;    # warm up, and count
+    my $t0 = time;
+    for ( 1 .. $reps ) { $search->($_) for @QUERIES }
+    return ( $hits, ( time - $t0 ) * 1000 / ( $reps * @QUERIES ) );
+}
+
+sub tantivy {
+    my ( $dir, $docs ) = @_;
+    require Search::Tantivy;
+    my $t0  = time;
+    my $idx = Search::Tantivy->create( path => $dir, fields => [ module => 'string', title => 'text:en', body => 'text:en' ] );
+    $idx->add_many( [ @$docs[ $_ .. min( $_ + 999, $#$docs ) ] ] ) for grep { $_ % 1000 == 0 } 0 .. $#$docs;
+    $idx->commit;
+    undef $idx;    # wait for merges, like the others' close
+    my $index_s = time - $t0;
+
+    $idx = Search::Tantivy->open($dir);
+    my ( $hits, $ms ) = timed_queries( sub {
+        my $res = $idx->search_page( $_[0], fields => [ 'title', 'body' ], default_operator => 'AND', limit => 10,
+            return_fields => ['module'] );
+        return $res->{total};
+    } );
+    return { index_s => $index_s, query_ms => $ms, hits => $hits };
+}
+
+sub fts5 {
+    my ( $dir, $docs ) = @_;
+    require DBI;
+    require DBD::SQLite;
+    my $t0 = time;
+    my $db = DBI->connect( "dbi:SQLite:dbname=$dir/fts.db", '', '', { RaiseError => 1, AutoCommit => 0, sqlite_unicode => 1 } );
+    $db->do(q{CREATE VIRTUAL TABLE pod USING fts5(module UNINDEXED, title, body, tokenize = 'porter unicode61')});
+    my $ins = $db->prepare('INSERT INTO pod (module, title, body) VALUES (?, ?, ?)');
+    $ins->execute( @$_{qw(module title body)} ) for @$docs;
+    $db->commit;
+    $db->disconnect;
+    my $index_s = time - $t0;
+
+    $db = DBI->connect( "dbi:SQLite:dbname=$dir/fts.db", '', '', { RaiseError => 1, sqlite_unicode => 1 } );
+    my $top   = $db->prepare('SELECT module FROM pod WHERE pod MATCH ? ORDER BY rank LIMIT 10');
+    my $count = $db->prepare('SELECT count(*) FROM pod WHERE pod MATCH ?');
+    my ( $hits, $ms ) = timed_queries( sub {
+        my $q = join ' ', map {qq{"$_"}} split ' ', $_[0];    # implicit AND, no operators
+        $top->execute($q);
+        $top->fetchall_arrayref;
+        $count->execute($q);
+        return ( $count->fetchrow_array )[0];
+    } );
+    return { index_s => $index_s, query_ms => $ms, hits => $hits };
+}
+
+sub lucy {
+    my ( $dir, $docs ) = @_;
+    require Lucy;
+    my $t0     = time;
+    my $schema = Lucy::Plan::Schema->new;
+    my $type   = Lucy::Plan::FullTextType->new( analyzer => Lucy::Analysis::EasyAnalyzer->new( language => 'en' ) );
+    $schema->spec_field( name => 'module', type => Lucy::Plan::StringType->new( indexed => 0 ) );
+    $schema->spec_field( name => $_, type => $type ) for qw(title body);
+    my $indexer = Lucy::Index::Indexer->new( index => $dir, schema => $schema, create => 1 );
+    $indexer->add_doc( { module => $_->{module}, title => $_->{title}, body => $_->{body} } ) for @$docs;
+    $indexer->commit;
+    my $index_s = time - $t0;
+
+    my $searcher = Lucy::Search::IndexSearcher->new( index => $dir );
+    my $parser   = Lucy::Search::QueryParser->new( schema => $searcher->get_schema, default_boolop => 'AND' );
+    my ( $hits, $ms ) = timed_queries( sub {
+        my $res = $searcher->hits( query => $parser->parse( $_[0] ), num_wanted => 10 );
+        while ( my $hit = $res->next ) { my $m = $hit->{module} }
+        return $res->total_hits;
+    } );
+    return { index_s => $index_s, query_ms => $ms, hits => $hits };
+}
+
+# --- corpus ------------------------------------------------------------------
+
+sub load_corpus {
+    my ( %dir_seen, %seen, @docs );
+    my @inc = grep { defined && !$dir_seen{$_}++ } map { Cwd::abs_path($_) } grep { !ref && -d } @INC;
+    for my $inc (@inc) {
+        File::Find::find(
+            {   no_chdir => 1,
+                wanted   => sub {
+                    return unless /\.(?:pm|pod)\z/ && -f;
+                    my $rel = File::Spec->abs2rel( $File::Find::name, $inc ) =~ s/\.(?:pm|pod)\z//r;
+                    my @parts = File::Spec->splitdir($rel);
+                    shift @parts if @parts == 2 && $parts[0] eq 'pod';
+                    return if grep { !/\A\w+\z/ } @parts;
+                    my $module = join '::', @parts;
+                    return if $seen{$module};
+                    my ( $title, $body ) = pod_text($File::Find::name) or return;
+                    $seen{$module} = 1;
+                    push @docs, { module => $module, title => $title, body => $body };
+                },
+            },
+            $inc
+        );
+    }
+    return \@docs;
+}
+
+sub pod_text {
+    my ($file) = @_;
+    open my $fh, '<:raw', $file or return;
+    my ( $in_pod, $name, $title, @body ) = ( 0, 0 );
+    while ( my $line = <$fh> ) {
+        if ( my ( $cmd, $arg ) = $line =~ /\A=(\w+)\s*(.*)/ ) {
+            $in_pod = $cmd ne 'cut';
+            $name   = $arg =~ /\ANAME\b/ if $cmd eq 'head1';
+            push @body, $arg if $in_pod;
+            next;
+        }
+        next unless $in_pod;
+        push @body, $line;
+        $title //= $1 if $name && $line =~ /\S.*?\s+-+\s+(.+)/;
+    }
+    return unless @body;
+    my $text = join '', @body;
+    utf8::decode($text);
+    $text =~ s/[A-Z]<+\s*|\s*>+//g;    # rough: drop formatting codes
+    $text =~ s/\s+/ /g;
+    $title //= '';
+    utf8::decode($title);
+    return ( $title, $text );
+}
+
+sub dir_size {
+    my $n = 0;
+    File::Find::find( sub { $n += -s if -f }, shift );
+    return $n;
+}
+
+sub min { $_[0] < $_[1] ? $_[0] : $_[1] }
