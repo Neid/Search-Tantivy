@@ -3,7 +3,7 @@ package Search::Tantivy;
 use strict;
 use warnings;
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 use Carp qw(croak);
 use File::Basename ();
@@ -52,6 +52,11 @@ sub _find_lib {
 
     croak "Search::Tantivy: cannot find $name (run 'cargo build --release' in rust/ or set SEARCH_TANTIVY_LIB)";
 }
+
+# Perl threads (and fork() on Windows, which is built on them) copy every
+# object; the copies would free the same Rust handle twice. Skip cloning:
+# a thread opens the index itself.
+sub CLONE_SKIP { 1 }
 
 sub _fail { croak 'Search::Tantivy: ' . ( _last_error() // 'unknown error' ) }
 
@@ -139,23 +144,43 @@ sub num_docs {
     return $n;
 }
 
-sub search {
-    my ( $self, $query, %opt ) = @_;
-    defined $query or croak 'search: query is required';
-    my %known = map { $_ => 1 } qw(limit fields snippets snippet_chars highlight default_operator boost);
+sub _run_search {
+    my ( $self, $method, $internal, $query, %opt ) = @_;
+    defined $query or croak "$method: query is required";
+    my %known = map { $_ => 1 } qw(limit offset fields snippets snippet_chars highlight default_operator boost fuzzy);
     my @unknown = grep { !$known{$_} } sort keys %opt;
-    croak "search: unknown option(s): @unknown" if @unknown;
-    $opt{limit} += 0 if defined $opt{limit};
-    $opt{snippet_chars} += 0 if defined $opt{snippet_chars};
+    croak "$method: unknown option(s): @unknown" if @unknown;
+    for my $n (qw(limit offset snippet_chars fuzzy)) {
+        next unless defined $opt{$n};
+        $opt{$n} =~ /\A\d+\z/ or croak "$method: $n must be a non-negative integer";
+        $opt{$n} += 0;
+    }
     if ( defined $opt{boost} ) {
-        ref $opt{boost} eq 'HASH' or croak 'search: boost must be a hash ref';
+        ref $opt{boost} eq 'HASH' or croak "$method: boost must be a hash ref";
         $opt{boost} = { map { $_ => 0 + $opt{boost}{$_} } keys %{ $opt{boost} } };
     }
-
+    %opt = ( %opt, %$internal );
     my $ptr = _search( $self, $query, $JSON->encode( \%opt ) ) or _fail();
     my $json = $ffi->cast( 'opaque' => 'string', $ptr );
     _string_free($ptr);
-    return @{ $JSON->decode($json) };
+    return $JSON->decode($json);
+}
+
+sub search {
+    my ( $self, $query, %opt ) = @_;
+    return @{ $self->_run_search( search => {}, $query, %opt )->{hits} };
+}
+
+sub search_page {
+    my ( $self, $query, %opt ) = @_;
+    return $self->_run_search( search_page => { count => JSON::PP::true }, $query, %opt );
+}
+
+sub count {
+    my ( $self, $query, %opt ) = @_;
+    my @not = grep { exists $opt{$_} } qw(limit offset snippets snippet_chars highlight);
+    croak "count: option(s) not used for counting: @not" if @not;
+    return $self->_run_search( count => { limit => 0, count => JSON::PP::true }, $query, %opt )->{total};
 }
 
 1;
@@ -257,19 +282,21 @@ C<text> fields are rejected. Takes effect on L</commit>.
 =head2 update($key_field, \%doc)
 
 Replaces the document(s) whose C<$key_field> equals C<< $doc->{$key_field} >>
-with C<\%doc> (or just adds it if there was none). Same rules as L</delete>;
+with C<\%doc> (or just adds it if there was none). Same rules as L</"delete($field, $value)">;
 takes effect on L</commit>.
 
     $index->update( url => { url => '/perl', title => 'Programming Perl, 4th ed.' } )->commit;
 
 =head2 commit
 
-Writes pending documents and makes them visible to L</search>.
+Writes pending documents and makes them visible to L</"search($query, %opt)">.
 
 =head2 search($query, %opt)
 
 Runs a query in tantivy's query language (C<perl AND camel>, C<title:rust>,
 C<"exact phrase">, C<year:[2000 TO 2020]>). Options: C<limit> (default 10),
+C<offset> (number of best hits to skip, for pages after the first; see also
+L</"search_page($query, %opt)">), C<fuzzy> (see L</Typo tolerance>),
 C<fields> (array ref of fields searched by terms without a C<field:> prefix;
 default: all text and string fields), C<snippets> (array ref of stored text
 fields to build highlighted excerpts for), C<snippet_chars> (maximum excerpt
@@ -285,8 +312,37 @@ an excerpt with the matching terms wrapped in the highlight markup and the rest
 HTML-escaped; empty if the field did not match.
 
     my ($hit) = $index->search( 'camel', snippets => ['body'] );
-    print $hit->{snippets}{body};   # The <b>camel</b> book about Perl 5 A field with one value is a plain scalar; a field with several
+    print $hit->{snippets}{body};   # The <b>camel</b> book about Perl 5
+
+In C<doc>, a field with one value is a plain scalar; a field with several
 values is an array ref.
+
+=head3 Typo tolerance
+
+C<< fuzzy => 1 >> lets every query term also match index terms one edit away
+(an inserted, deleted, changed or swapped letter), so C<mechanzie> finds
+I<mechanize>; C<< fuzzy => 2 >> allows two edits. Exact matches still rank
+above near misses, snippets highlight the words that actually matched, and
+phrases (C<"...">) stay exact. On stemmed fields the edit distance is measured
+between stems. Short words have many neighbours at distance 2, so 1 is the
+better default for user-typed queries.
+
+=head2 search_page($query, %opt)
+
+Like L</"search($query, %opt)">, with the same options, but returns a hash ref with the hits
+of one page and the number of all matching documents, for "21-30 of 342"
+navigation:
+
+    my $per_page = 10;
+    my $res = $index->search_page( $q, limit => $per_page, offset => ( $page - 1 ) * $per_page );
+    printf "%d results\n", $res->{total};
+    print "$_->{doc}{title}\n" for @{ $res->{hits} };
+
+=head2 count($query, %opt)
+
+Number of documents matching C<$query>. Takes the query options of
+L</"search($query, %opt)"> (C<fields>, C<default_operator>, C<fuzzy>, ...), not the paging or
+snippet ones.
 
 =head2 reload
 
@@ -303,6 +359,20 @@ Only one process can write to an index at a time; any number can search it.
 =head2 num_docs
 
 Number of committed documents.
+
+=head1 FORK AND THREADS
+
+Opening an index before C<fork()> and searching it in the children (as
+preforking servers such as Starman or mod_perl do) is fine. Writing is
+different: the object that wrote (added, deleted or committed) owns tantivy's
+background threads and the index's write lock, and both stay with the process
+that wrote. In a child that inherited such an object, writing methods croak;
+open the index again in the child if it has to write (only one process can
+hold the write lock at a time). Destroying the inherited object in the child
+is safe and leaves the parent's writer alone.
+
+Objects are not copied into new Perl threads (or Windows pseudo-processes
+created by C<fork()>): open the index again inside the thread.
 
 =head1 ERRORS
 

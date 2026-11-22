@@ -24,7 +24,17 @@ for my $hit ($index->search('camel OR title:perl', limit => 5, snippets => ['bod
 $index->update(url => { url => '/perl', title => 'Programming Perl, 4th ed.', body => '...' });
 $index->delete(url => '/old-page');
 $index->commit;
+
+# page 3 of the results, and how many there are in total
+my $page = $index->search_page('perl', limit => 10, offset => 20);
+print "$page->{total} results\n";
+
+# typo tolerance: "mechanzie" finds "mechanize"
+my @hits = $index->search('mechanzie', fuzzy => 1);
 ```
+
+Safe with preforking servers (Starman, mod_perl): open the index in the parent and
+search in the children. See *FORK AND THREADS* in the POD for writing.
 
 Status: early, API may change.
 
@@ -54,7 +64,7 @@ $ examples/podsearch -n 1 'Data::Dumper'
     feasible $Data::Dumper::Indent = 0; # turn off all pretty print print Dumper($boo), "\n"; $Data: ...
     perldoc Data::Dumper
 
-1 result from 1587 documents in 9.1 ms
+1 of 59 matches (1587 documents) in 9.1 ms
 ```
 
 Run `podsearch --index` from cron to keep it current; searches keep working during a
@@ -63,7 +73,7 @@ rebuild.
 ## Installing
 
 ```sh
-cpanm https://github.com/Neid/Search-Tantivy/releases/download/v0.03/Search-Tantivy-0.03.tar.gz
+cpanm https://github.com/Neid/Search-Tantivy/releases/download/v0.04/Search-Tantivy-0.04.tar.gz
 ```
 
 (Not on CPAN yet; this installs the release tarball straight from GitHub.)

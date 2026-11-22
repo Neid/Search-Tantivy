@@ -13,6 +13,14 @@
 //! or valid NUL-terminated strings, and index handles that are NULL or were
 //! returned by `st_index_create` / `st_index_open` and not yet freed. Handles
 //! must not be used from several threads at once.
+//!
+//! # fork()
+//! A forked child inherits the memory of an index writer but not its
+//! threads. The handle remembers which process opened the writer; any other
+//! process gets an error when it tries to write, and freeing the handle
+//! there leaks the writer instead of joining threads that do not exist
+//! (which would hang) or releasing the parent's write lock. Searching
+//! works in both processes.
 
 #![allow(clippy::missing_safety_doc)] // covered by the crate-level Safety section
 
@@ -24,8 +32,14 @@ use std::ptr;
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use std::collections::{BTreeMap, BTreeSet};
+use std::mem;
+use std::process;
+
+use tantivy::collector::{Count, TopDocs};
+use tantivy::query::{
+    BooleanQuery, BoostQuery, FuzzyTermQuery, Occur, Query, QueryParser, TermQuery,
+};
 use tantivy::schema::document::Document as _;
 use tantivy::schema::{
     Field, FieldType, IndexRecordOption, NumericOptions, STORED, STRING, Schema, TEXT,
@@ -37,6 +51,11 @@ use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Te
 mod analyzers;
 
 const WRITER_HEAP_BYTES: usize = 50_000_000;
+
+/// At most this many index terms stand in for one misspelled query term.
+const MAX_FUZZY_VARIANTS: usize = 50;
+/// Score weight of a fuzzy variant relative to the term as typed.
+const FUZZY_VARIANT_BOOST: f32 = 0.5;
 
 type Res<T> = Result<T, String>;
 
@@ -107,7 +126,8 @@ fn err<E: std::fmt::Display>(ctx: &'static str) -> impl FnOnce(E) -> String {
 pub struct StIndex {
     index: Index,
     reader: IndexReader,
-    writer: Option<IndexWriter>,
+    /// The writer and the id of the process that opened it.
+    writer: Option<(IndexWriter, u32)>,
 }
 
 impl StIndex {
@@ -126,14 +146,22 @@ impl StIndex {
     }
 
     fn writer(&mut self) -> Res<&mut IndexWriter> {
+        if let Some((_, pid)) = &self.writer
+            && *pid != process::id()
+        {
+            return Err("this index was opened for writing before a fork(); \
+                        writing is only possible in the process that opened it \
+                        (open the index again in this process to write)"
+                .into());
+        }
         if self.writer.is_none() {
             let w = self
                 .index
                 .writer(WRITER_HEAP_BYTES)
                 .map_err(err("cannot open index writer"))?;
-            self.writer = Some(w);
+            self.writer = Some((w, process::id()));
         }
-        Ok(self.writer.as_mut().expect("just set"))
+        Ok(&mut self.writer.as_mut().expect("just set").0)
     }
 }
 
@@ -320,8 +348,15 @@ pub unsafe extern "C" fn st_index_free(h: *mut StIndex) {
             // Let background merges finish so no segment file is still open
             // when we return: on Windows an open file blocks renaming or
             // deleting the index directory right after the object is gone.
-            if let Some(w) = h.writer.take() {
-                let _ = w.wait_merging_threads();
+            match h.writer.take() {
+                Some((w, pid)) if pid == process::id() => {
+                    let _ = w.wait_merging_threads();
+                }
+                // Inherited through fork(): its threads live in the parent.
+                // Dropping it here would wait for them forever and could
+                // remove the parent's lock file, so leak it instead.
+                Some((w, _)) => mem::forget(w),
+                None => {}
             }
             drop(h);
         }));
@@ -385,6 +420,12 @@ struct SearchOptions {
     /// Default fields for terms without a `field:` prefix.
     fields: Option<Vec<String>>,
     limit: usize,
+    /// Number of top hits to skip (pagination).
+    offset: usize,
+    /// Also count all matching documents.
+    count: bool,
+    /// Edit distance (1 or 2) for typo-tolerant matching of query terms.
+    fuzzy: u8,
     /// Stored text fields to build highlighted snippets for.
     snippets: Vec<String>,
     snippet_chars: Option<usize>,
@@ -393,7 +434,7 @@ struct SearchOptions {
     /// "OR" (default: any term may match) or "AND" (all terms must).
     default_operator: Option<String>,
     /// Score multiplier per field, e.g. {"title": 3.0}.
-    boost: std::collections::BTreeMap<String, f32>,
+    boost: BTreeMap<String, f32>,
 }
 
 impl Default for SearchOptions {
@@ -401,6 +442,9 @@ impl Default for SearchOptions {
         Self {
             fields: None,
             limit: 10,
+            offset: 0,
+            count: false,
+            fuzzy: 0,
             snippets: Vec::new(),
             snippet_chars: None,
             highlight: None,
@@ -416,9 +460,89 @@ fn field_by_name(schema: &Schema, name: &str) -> Res<Field> {
         .map_err(|_| format!("unknown field '{name}'"))
 }
 
+/// Text fields the query parser would make fuzzy (tokenized or raw strings).
+fn is_text(schema: &Schema, f: Field) -> bool {
+    matches!(schema.get_field_entry(f).field_type(), FieldType::Str(_))
+}
+
+/// Index terms within `distance` edits of `term` (excluding `term` itself),
+/// across all segments, at most `MAX_FUZZY_VARIANTS`.
+fn fuzzy_variants(
+    searcher: &tantivy::Searcher,
+    term: &Term,
+    distance: u8,
+) -> Res<BTreeSet<Vec<u8>>> {
+    let automaton = FuzzyTermQuery::new(term.clone(), distance, true)
+        .automaton()
+        .map_err(err("fuzzy query"))?;
+    let own = term.serialized_value_bytes();
+    let mut out = BTreeSet::new();
+    for segment in searcher.segment_readers() {
+        let inverted = segment
+            .inverted_index(term.field())
+            .map_err(err("cannot read terms"))?;
+        let mut stream = inverted
+            .terms()
+            .search(&automaton)
+            .into_stream()
+            .map_err(err("cannot read terms"))?;
+        while stream.advance() {
+            if stream.key() != own {
+                out.insert(stream.key().to_vec());
+                if out.len() >= MAX_FUZZY_VARIANTS {
+                    return Ok(out);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Typo-tolerant version of `exact`. tantivy's fuzzy term queries match but
+/// give every hit the same score and report no terms to highlight, so:
+/// documents must match `fuzzy` (the same query with fuzzy terms), and are
+/// scored by `exact` plus the real index terms the fuzzy terms expand to.
+fn fuzzy_query(
+    searcher: &tantivy::Searcher,
+    schema: &Schema,
+    exact: Box<dyn Query>,
+    fuzzy: Box<dyn Query>,
+    distance: u8,
+    boost: &BTreeMap<String, f32>,
+) -> Res<Box<dyn Query>> {
+    let mut terms = Vec::new();
+    exact.query_terms(&mut |t, _| terms.push(t.clone()));
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> =
+        vec![(Occur::Must, fuzzy), (Occur::Should, exact)];
+    for term in terms.iter().filter(|t| is_text(schema, t.field())) {
+        let field_boost = boost
+            .get(schema.get_field_name(term.field()))
+            .copied()
+            .unwrap_or(1.0);
+        for bytes in fuzzy_variants(searcher, term, distance)? {
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            let q = TermQuery::new(
+                Term::from_field_text(term.field(), text),
+                IndexRecordOption::WithFreqs,
+            );
+            clauses.push((
+                Occur::Should,
+                Box::new(BoostQuery::new(
+                    Box::new(q),
+                    FUZZY_VARIANT_BOOST * field_boost,
+                )),
+            ));
+        }
+    }
+    Ok(Box::new(BooleanQuery::new(clauses)))
+}
+
 /// Run a query. `options_json` is an optional JSON object (see
-/// `SearchOptions`). Returns a JSON array of
-/// `{"score": f, "doc": {...}, "snippets": {...}}` to be freed with
+/// `SearchOptions`). Returns a JSON object
+/// `{"hits": [{"score": f, "doc": {...}, "snippets": {...}}], "total": n}`
+/// (`total` only with the `count` option) to be freed with
 /// `st_string_free`, or NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn st_index_search(
@@ -447,7 +571,7 @@ pub unsafe extern "C" fn st_index_search(
                 .collect(),
         };
 
-        let mut parser = QueryParser::for_index(&h.index, fields);
+        let mut parser = QueryParser::for_index(&h.index, fields.clone());
         match opts
             .default_operator
             .as_deref()
@@ -466,8 +590,19 @@ pub unsafe extern "C" fn st_index_search(
             }
             parser.set_field_boost(field_by_name(&schema, name)?, *factor);
         }
-        let q = parser.parse_query(query).map_err(err("invalid query"))?;
+        let exact = parser.parse_query(query).map_err(err("invalid query"))?;
         let searcher = h.reader.searcher();
+        let q = match opts.fuzzy {
+            0 => exact,
+            d @ (1 | 2) => {
+                for f in fields.iter().filter(|f| is_text(&schema, **f)) {
+                    parser.set_field_fuzzy(*f, false, d, true);
+                }
+                let fuzzy = parser.parse_query(query).map_err(err("invalid query"))?;
+                fuzzy_query(&searcher, &schema, exact, fuzzy, d, &opts.boost)?
+            }
+            other => return Err(format!("fuzzy must be 0, 1 or 2, got {other}")),
+        };
 
         let mut generators = Vec::with_capacity(opts.snippets.len());
         for name in &opts.snippets {
@@ -486,9 +621,29 @@ pub unsafe extern "C" fn st_index_search(
             generators.push((name.as_str(), g));
         }
 
-        let top = searcher
-            .search(&q, &TopDocs::with_limit(opts.limit.max(1)).order_by_score())
-            .map_err(err("search failed"))?;
+        let (top, total) = match (opts.limit, opts.count) {
+            (0, false) => (Vec::new(), None),
+            (0, true) => {
+                let n = searcher.search(&q, &Count).map_err(err("search failed"))?;
+                (Vec::new(), Some(n))
+            }
+            (limit, count) => {
+                let top_docs = TopDocs::with_limit(limit)
+                    .and_offset(opts.offset)
+                    .order_by_score();
+                if count {
+                    let (n, top) = searcher
+                        .search(&q, &(Count, top_docs))
+                        .map_err(err("search failed"))?;
+                    (top, Some(n))
+                } else {
+                    let top = searcher
+                        .search(&q, &top_docs)
+                        .map_err(err("search failed"))?;
+                    (top, None)
+                }
+            }
+        };
 
         let mut hits = Vec::with_capacity(top.len());
         for (score, addr) in top {
@@ -510,7 +665,11 @@ pub unsafe extern "C" fn st_index_search(
             }
             hits.push(hit);
         }
-        into_c_string(Value::Array(hits).to_string())
+        let mut out = serde_json::json!({ "hits": hits });
+        if let Some(n) = total {
+            out["total"] = Value::from(n);
+        }
+        into_c_string(out.to_string())
     })
 }
 

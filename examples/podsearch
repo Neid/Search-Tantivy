@@ -32,24 +32,26 @@ GetOptions(
     'dir=s'   => \$dir,
     'n=i'     => \$limit,
     'exact'   => \my $exact,
+    'fuzzy'   => \my $fuzzy,
     'help|h'  => \my $help,
 ) or usage(2);
 usage(0) if $help;
 
 if ($build) { build_index($dir); exit 0 unless @ARGV }
 usage(2) unless @ARGV;
-search( $dir, "@ARGV", $exact );
+search( $dir, "@ARGV" );
 
 # ---------------------------------------------------------------------------
 
 sub usage {
     print <<"USAGE";
 usage: podsearch --index            index the POD of every module in \@INC
-       podsearch [-n N] [--exact] QUERY
+       podsearch [-n N] [--exact] [--fuzzy] QUERY
                                     search it (tantivy query syntax:
                                     words, "phrases", AND/OR, title:word)
 options: --exact    match words exactly, no stemming
                     (by default "sorting" also finds "sort"; exact matches rank first)
+         --fuzzy    tolerate typos ("mechanzie" finds "mechanize")
          --dir DIR (default $dir)
 USAGE
     exit shift;
@@ -170,7 +172,7 @@ sub strip_codes {
 }
 
 sub search {
-    my ( $dir, $query, $exact ) = @_;
+    my ( $dir, $query ) = @_;
     -d $dir or die "No index at $dir - run: podsearch --index\n";
     my $idx = Search::Tantivy->open($dir);
 
@@ -182,7 +184,7 @@ sub search {
     my ( $on, $off ) = $tty ? ( "\e[1;33m", "\e[0m" ) : ( '*', '*' );
 
     my $t0   = time;
-    my @hits = $idx->search(
+    my $res = $idx->search_page(
         $query,
         limit         => $limit,
         fields => $exact
@@ -194,7 +196,9 @@ sub search {
         # name/title hits first; exact word forms above stemmed look-alikes
         boost => { module => 5, title => 1, title_exact => 4, body_exact => 4 },
         highlight     => [ "\x{1}", "\x{2}" ],    # placeholders, replaced after unescaping
+        ( $fuzzy ? ( fuzzy => 1 ) : () ),
     );
+    my @hits = @{ $res->{hits} };
     my $ms = ( time - $t0 ) * 1000;
 
     my $n = 0;
@@ -208,7 +212,8 @@ sub search {
         print "    $snippet\n" if length $snippet;
         print "    perldoc $doc->{module}\n\n";
     }
-    printf "%d result%s from %d documents in %.1f ms\n", scalar @hits, ( @hits == 1 ? '' : 's' ), $idx->num_docs, $ms;
+    printf "%d of %d match%s (%d documents) in %.1f ms\n", scalar @hits, $res->{total},
+      ( $res->{total} == 1 ? '' : 'es' ), $idx->num_docs, $ms;
 }
 
 sub unescape {

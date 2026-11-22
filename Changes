@@ -1,5 +1,15 @@
 Revision history for Search-Tantivy
 
+0.04  2026-11-22
+      - search() option offset, search_page() returning hits plus the total
+        number of matches, and count().
+      - Typo tolerance: search option fuzzy => 1|2. Exact matches rank first;
+        snippets highlight the words that matched.
+      - fork() safety: an object that wrote no longer hangs or releases the
+        parent's write lock when destroyed in a child; writing there croaks.
+        Objects are not cloned into new threads (would double free).
+      - examples/podsearch: --fuzzy, total number of matches.
+
 0.03  2026-11-22
       - Language-aware text fields: stemming for 19 languages incl. Polish
         (language option, or shorthand type 'text:pl'), and ascii_folding.
