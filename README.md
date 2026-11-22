@@ -127,12 +127,17 @@ queries (top 10 + total count, all words required):
 
 ```
 $ examples/bench
-Corpus: 1587 documents, 17.7 MB of text (POD in @INC)
+Corpus: 1644 documents, 18.5 MB of text (POD in @INC)
 engine                              index (s)  size (MB)   query (ms)     hits
-Search::Tantivy 0.05                     0.45       15.5        0.289     1652
+Search::Tantivy 0.06                     0.46       16.2        0.299     1719
+SQLite FTS5 (DBD::SQLite 1.78)           0.34       27.6        0.477     1719
 ```
 
-Numbers from one laptop; run it on yours.
+At this size both are fast: queries take well under a millisecond, and SQLite indexes
+somewhat faster. Search::Tantivy's index is about 40% smaller and its queries about
+30% faster. Both find the same 1719 matches. The difference that matters more is
+features: FTS5's only built-in stemmer is Porter (English), and it has no typo
+tolerance or sorting by field inside the search engine. Numbers from one laptop; run `examples/bench` on yours.
 
 ## How it works
 
